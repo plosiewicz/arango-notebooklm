@@ -1,0 +1,272 @@
+"""
+Gong to Google Docs sync Cloud Function.
+Triggered daily by Cloud Scheduler to sync recent call transcripts.
+Supports backfill mode for historical calls.
+"""
+import json
+import os
+from datetime import datetime, timedelta
+
+from gong_api import (
+    get_calls_since,
+    get_calls_in_range,
+    get_call_details,
+    get_transcript,
+    format_transcript,
+    get_account_info_from_call
+)
+from google_docs import append_to_doc, format_call_for_doc
+
+
+# Load account mapping
+# Keys can be either Account IDs (preferred) or Account Names (fallback)
+with open('account-mapping.json', 'r') as f:
+    account_mapping = json.load(f)
+
+# Track processed calls to avoid duplicates (in production, use a database)
+processed_calls_file = '/tmp/processed_gong_calls.json'
+
+
+def load_processed_calls():
+    """Load set of already processed call IDs."""
+    try:
+        with open(processed_calls_file, 'r') as f:
+            return set(json.load(f))
+    except:
+        return set()
+
+
+def save_processed_calls(call_ids):
+    """Save processed call IDs."""
+    try:
+        with open(processed_calls_file, 'w') as f:
+            json.dump(list(call_ids), f)
+    except Exception as e:
+        print(f"Warning: Could not save processed calls: {e}")
+
+
+def find_mapping_for_account(account_id, account_name):
+    """
+    Find the mapping for an account by ID or name.
+    Tries ID first (more reliable), then falls back to name.
+    """
+    # Try exact match on account ID
+    if account_id and account_id in account_mapping:
+        return account_mapping[account_id]
+    
+    # Try exact match on account name
+    if account_name and account_name in account_mapping:
+        return account_mapping[account_name]
+    
+    # Try case-insensitive match on account name
+    if account_name:
+        for key, value in account_mapping.items():
+            if key.lower() == account_name.lower():
+                return value
+    
+    return None
+
+
+def process_calls(calls, skip_processed=True):
+    """
+    Process a list of calls - fetch details, transcripts, and sync to docs.
+    
+    Args:
+        calls: List of call objects from Gong API
+        skip_processed: Whether to skip already processed calls
+    
+    Returns:
+        Tuple of (processed_count, errors_list, skipped_accounts)
+    """
+    if not calls:
+        return (0, [], {})
+    
+    # Load previously processed calls
+    processed_calls = load_processed_calls() if skip_processed else set()
+    
+    # Filter out already processed calls if needed
+    if skip_processed:
+        new_calls = [c for c in calls if c.get("id") not in processed_calls]
+        print(f"Found {len(calls)} calls, {len(new_calls)} are new")
+    else:
+        new_calls = calls
+        print(f"Processing {len(new_calls)} calls (backfill mode)")
+    
+    if not new_calls:
+        return (0, [], {})
+    
+    # Get detailed info for calls (batch in groups of 100)
+    all_detailed = []
+    call_ids = [c.get("id") for c in new_calls]
+    
+    print(f"Fetching details for {len(call_ids)} calls...")
+    for i in range(0, len(call_ids), 100):
+        batch = call_ids[i:i+100]
+        print(f"Fetching batch {i//100 + 1}: {len(batch)} calls")
+        detailed = get_call_details(batch)
+        print(f"Got {len(detailed)} detailed results")
+        all_detailed.extend(detailed)
+    
+    print(f"Total detailed calls retrieved: {len(all_detailed)}")
+    
+    # Create a lookup by call ID
+    call_details_map = {c.get("metaData", {}).get("id"): c for c in all_detailed}
+    print(f"Call details map has {len(call_details_map)} entries")
+    
+    # Debug: Print first 3 raw calls from the API
+    print(f"DEBUG: First 3 raw calls from list API:")
+    for i, c in enumerate(new_calls[:3]):
+        print(f"  DEBUG Raw call {i}: {c}")
+    
+    processed_count = 0
+    errors = []
+    skipped_accounts = {}  # Track accounts with no mapping
+    
+    # Debug: Log first 3 call details to understand data structure
+    debug_count = 0
+    for call in new_calls:
+        call_id = call.get("id")
+        
+        try:
+            # Get detailed call info
+            details = call_details_map.get(call_id, {})
+            
+            # Debug logging for first few calls
+            if debug_count < 3:
+                print(f"DEBUG call {call_id} basic info: {call}")
+                print(f"DEBUG call {call_id} details keys: {list(details.keys()) if details else 'NO DETAILS'}")
+                if details:
+                    print(f"DEBUG call {call_id} context: {details.get('context', 'NO CONTEXT')}")
+                    print(f"DEBUG call {call_id} parties: {details.get('parties', 'NO PARTIES')[:2] if details.get('parties') else 'NO PARTIES'}")
+                debug_count += 1
+            
+            # Get account ID and name
+            account_id, account_name = get_account_info_from_call(details)
+            
+            if not account_id and not account_name:
+                print(f"Could not determine account for call {call_id}, skipping")
+                continue
+            
+            # Look up the Google Doc for this account
+            mapping = find_mapping_for_account(account_id, account_name)
+            
+            if not mapping:
+                # Track skipped accounts for reporting
+                key = account_name or account_id
+                skipped_accounts[key] = skipped_accounts.get(key, 0) + 1
+                print(f"No mapping found for account '{account_name}' (ID: {account_id}), skipping")
+                continue
+            
+            doc_id = mapping.get("docId")
+            
+            # Get transcript
+            transcript_entries = get_transcript(call_id)
+            
+            # Build participant lookup for transcript formatting
+            parties = details.get("parties", [])
+            participants = {p.get("speakerId"): p for p in parties}
+            
+            # Format transcript
+            formatted_transcript = format_transcript(transcript_entries, participants)
+            
+            # Get summary/brief
+            content = details.get("content", {})
+            summary = content.get("brief")
+            
+            # Build call details for doc formatting
+            call_info = {
+                "title": details.get("metaData", {}).get("title", "Untitled Call"),
+                "started": details.get("metaData", {}).get("started"),
+                "duration": details.get("metaData", {}).get("duration", 0),
+                "parties": parties
+            }
+            
+            # Format for doc
+            doc_content = format_call_for_doc(call_info, formatted_transcript, summary)
+            
+            # Append to Google Doc
+            append_to_doc(doc_id, doc_content)
+            
+            print(f"Successfully synced call '{call_info['title']}' for '{account_name}'")
+            processed_calls.add(call_id)
+            processed_count += 1
+            
+        except Exception as e:
+            error_msg = f"Error processing call {call_id}: {str(e)}"
+            print(error_msg)
+            errors.append(error_msg)
+    
+    # Save processed calls
+    save_processed_calls(processed_calls)
+    
+    return (processed_count, errors, skipped_accounts)
+
+
+def gong_sync(request):
+    """
+    Main Cloud Function entry point.
+    
+    Query parameters:
+    - backfill: Set to 'true' to enable backfill mode
+    - days: Number of days to backfill (default: 90)
+    - hours: For regular sync, hours to look back (default: 25)
+    """
+    # Parse query parameters
+    args = request.args if hasattr(request, 'args') else {}
+    
+    backfill_mode = args.get('backfill', 'false').lower() == 'true'
+    
+    print(f"Starting Gong sync at {datetime.utcnow().isoformat()}")
+    print(f"Backfill mode: {backfill_mode}")
+    
+    if backfill_mode:
+        # Backfill mode - get historical calls
+        days = int(args.get('days', 90))
+        print(f"Backfill: Fetching calls from the last {days} days")
+        
+        to_date = datetime.utcnow()
+        from_date = to_date - timedelta(days=days)
+        
+        calls = get_calls_in_range(from_date, to_date)
+        skip_processed = False  # Process all calls in backfill mode
+    else:
+        # Normal mode - get recent calls
+        hours = int(args.get('hours', 25))
+        print(f"Normal mode: Fetching calls from the last {hours} hours")
+        
+        calls = get_calls_since(hours_ago=hours)
+        skip_processed = True
+    
+    if not calls:
+        print("No calls found in the specified time range.")
+        return {"message": "No calls to process", "processed": 0}, 200
+    
+    print(f"Found {len(calls)} calls to process")
+    
+    # Process the calls
+    processed_count, errors, skipped_accounts = process_calls(calls, skip_processed)
+    
+    result = {
+        "message": f"Processed {processed_count} calls",
+        "processed": processed_count,
+        "total_found": len(calls),
+        "skipped_accounts": skipped_accounts if skipped_accounts else None,
+        "errors": errors if errors else None
+    }
+    
+    print(f"Gong sync complete: {result}")
+    return result, 200
+
+
+# For local testing
+if __name__ == '__main__':
+    from flask import Flask, request
+    app = Flask(__name__)
+
+    @app.route('/', methods=['GET', 'POST'])
+    def handle():
+        return gong_sync(request)
+
+    port = int(os.environ.get('PORT', 3001))
+    print(f'Server running on port {port}')
+    app.run(host='0.0.0.0', port=port)
