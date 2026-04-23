@@ -159,15 +159,24 @@ hourly by Cloud Scheduler. Flow on every run:
 2. Rebuilds `channel-mapping.json` / `account-mapping.json` from the
    `Y`-flagged rows plus any new ones, writes them to the GCS config
    bucket only if the content actually changed.
-3. For each row where `Config done (Y/N)` is blank:
+3. For each row where `Config done (Y/N)` is blank **and** the key
+   isn't already in the GCS mapping:
    - Slack rows: computes `oldest_ts` from the `Backlog through`
      column, or falls back to the channel's creation date (via
      `conversations.info` using `slack-bot-token`) capped at
      Jan 1 2024, then `curl`s slack-sync's backfill endpoint.
    - Gong rows: computes `days` since `backlog-through` or
-     Jan 1 2024, then `curl`s gong-sync's backfill endpoint.
-4. Writes `Y` back into `Config done (Y/N)` for rows whose backfill
-   completed.
+     Jan 1 2024, then `curl`s gong-sync's backfill endpoint with
+     `account=<customer-email-domain>` so gong-sync's per-call work
+     is scoped to just this customer. Without the filter, gong-sync
+     would dedup against every mapped customer doc and config-sync
+     OOMs waiting for the response.
+4. Writes `Y` back into `Config done (Y/N)` **only** for rows whose
+   backfill HTTP call returned 200. Failed rows stay blank so the
+   operator can see the problem - they do not auto-retry on the next
+   run because the GCS mapping was already saved at step 2 and the
+   new-row guard above filters them out. See "Sheet row stuck on
+   blank" below.
 
 ---
 
@@ -285,6 +294,7 @@ though `shared/` is gitignored inside the service dir.
 | `Failed to get credentials from Secret Manager` | SA missing `secretAccessor`, or secret renamed | Secret Manager IAM |
 | gong-sync "skipped_accounts" entries | Gong labels the account differently than the sheet key | `gcloud functions logs read gong-sync`, find what Gong returned, add a row |
 | Duplicate Slack messages | Should never happen now - retry-drop + header dedup both active | slack-sync logs for `"Ignoring Slack retry"` |
+| Sheet row stuck on blank `Config done` after onboarding | Backfill returned non-200, or config-sync was killed before writing the cell. Mapping was saved before the backfill ran, so the next config-sync run skips it (`not in current_mapping` guard). | Check the relevant `gong-sync`/`slack-sync` logs for that customer, re-trigger the backfill manually with `?account=` (Gong) or `?channel=` (Slack), then flip the cell to `Y` by hand. |
 | NotebookLM source stale | Doc is up to date; NotebookLM caches aggressively | re-index in the NotebookLM UI |
 
 ---

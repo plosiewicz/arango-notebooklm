@@ -132,10 +132,13 @@ Flow (runs hourly from config-sync):
 2. Rebuilds the mapping JSON for each tab and writes it to the
    `slack-notebooklm-config` GCS bucket
    (`channel-mapping.json`, `account-mapping.json`).
-3. For each row where `Config done (Y/N)` is blank, config-sync
-   triggers a one-shot backfill on slack-sync (from `Backlog through`
-   or channel creation) or gong-sync (last N days since
-   `backlog-through`), then writes `Y` back into the sheet.
+3. For each row where `Config done (Y/N)` is blank and the key isn't
+   already in the GCS mapping, config-sync triggers a one-shot
+   backfill on slack-sync (from `Backlog through` or channel creation)
+   or gong-sync (last N days since `backlog-through`, scoped to the
+   row's email domain via `?account=`). Writes `Y` back into the
+   sheet only if the backfill returned HTTP 200; failed rows stay
+   blank for manual remediation (see Troubleshooting).
 
 slack-sync / gong-sync read the GCS mapping on every request with a
 5-minute in-memory cache.
@@ -151,7 +154,9 @@ slack-sync / gong-sync read the GCS mapping on every request with a
    ```bash
    curl "https://us-central1-slack-notebooklm-sync.cloudfunctions.net/config-sync"
    ```
-5. config-sync flips `Config done` to `Y` once the backfill is done.
+5. config-sync flips `Config done` to `Y` once the backfill returns
+   HTTP 200. If the cell stays blank after the next hourly run, the
+   backfill failed - see Troubleshooting.
 6. Add the Google Doc as a source in the customer's NotebookLM.
 
 ---
@@ -194,6 +199,7 @@ gcloud functions logs read config-sync --region=us-central1 --project=slack-note
 | `Failed to get credentials from Secret Manager` | Service account lacks Secret Accessor, or the secret name doesn't exist | Grant role or create/rename the secret. |
 | gong-sync "skipped_accounts" in logs | Account on the call doesn't match any sheet row | Add the account (email domain, name, or CRM id) to the `gong` tab. |
 | Duplicate Slack messages | Slack retried before the function returned 200 | Verified dedup: function drops `X-Slack-Retry-Num` headers. Check logs. |
+| Sheet row stuck on blank `Config done` after onboarding | Backfill returned non-200, or config-sync was killed before writing the cell. Mapping was saved at the start of the run so config-sync won't auto-retry. | Check `gong-sync` / `slack-sync` logs for that customer, re-run the backfill manually (`?account=` for Gong, `?channel=` for Slack), then mark `Y` by hand. |
 | NotebookLM source not updating | Doc updated, but NotebookLM cache | Re-index in NotebookLM UI. |
 
 ---
