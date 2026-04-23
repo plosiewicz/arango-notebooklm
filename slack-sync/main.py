@@ -59,9 +59,18 @@ def verify_slack_signature(request):
     except ValueError:
         return False
 
+    try:
+        signing_secret = get_secret('slack-signing-secret')
+    except Exception as e:
+        # Fail closed: if we can't load the signing secret (Secret Manager
+        # outage, IAM misconfig, missing version) we must reject the
+        # request rather than let it through unauthenticated.
+        print(f'Failed to load slack signing secret: {e}')
+        return False
+
     sig_basestring = f'v0:{timestamp}:{body}'
     my_signature = 'v0=' + hmac.new(
-        get_secret('slack-signing-secret').encode(),
+        signing_secret.encode(),
         sig_basestring.encode(),
         hashlib.sha256,
     ).hexdigest()
