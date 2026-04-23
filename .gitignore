@@ -20,3 +20,12 @@ node_modules/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local copies of config mappings (source of truth is GCS, managed via config-sync)
+slack-sync/channel-mapping.json
+gong-sync/account-mapping.json
+
+# Deploy-time copies of the shared/ module (rsynced in by each service's deploy.sh)
+slack-sync/shared/
+gong-sync/shared/
+config-sync/shared/
