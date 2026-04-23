@@ -1,0 +1,17 @@
+[tool.ruff]
+# Limit scope to Python sources that ship to Cloud Functions + shared libs + tests.
+# Deliberately excluding .git, venv, etc. (ruff already skips these by default).
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+# Only the Pyflakes ruleset for now. F821 (undefined name) catches the
+# json-import-drop class of regression; F401 flags dead imports. We are
+# not trying to restyle the codebase in this change - opinions like E/W
+# and import sorting (I) can come in a later commit.
+select = ["F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests intentionally import fixtures that look unused to static analysis
+# but are injected by pytest. Unused imports are still caught elsewhere.
+"tests/*" = ["F401"]
