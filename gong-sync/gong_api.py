@@ -1,63 +1,41 @@
-"""
-Gong API client for fetching calls, transcripts, and summaries.
-"""
+"""Gong API client for fetching calls, transcripts, and summaries."""
 import base64
-import requests
 from datetime import datetime, timedelta
-from google.cloud import secretmanager
+
+import requests
+
+from shared.secrets import get_secret
 
 
-# Gong API base URL
 GONG_API_BASE = "https://api.gong.io/v2"
 
-# Cache for encoded credentials
 _encoded_creds = None
 
 
 def get_encoded_credentials():
-    """
-    Get Gong API credentials from Secret Manager and return base64-encoded.
-    
-    Secret should be stored as: accessKeyId:accessKeySecret
+    """Return the base64-encoded Gong API credentials for Basic auth.
+
+    The secret is stored as `accessKeyId:accessKeySecret` and we encode
+    it ourselves. If a future secret happens to already be base64 (no
+    colon), we pass it through.
     """
     global _encoded_creds
-    
     if _encoded_creds is not None:
         return _encoded_creds
-    
-    try:
-        print("Fetching API credentials from Secret Manager...")
-        client = secretmanager.SecretManagerServiceClient()
-        secret_path = "projects/slack-notebooklm-sync/secrets/gong-api-key/versions/latest"
-        response = client.access_secret_version(name=secret_path)
-        raw_creds = response.payload.data.decode('UTF-8').strip()
-        
-        # Check if it's already base64 encoded or needs encoding
-        # If it contains a colon, assume it's accessKeyId:accessKeySecret format
-        if ':' in raw_creds and not raw_creds.startswith('eyJ'):
-            print(f"Credentials in accessKeyId:accessKeySecret format (length: {len(raw_creds)})")
-            _encoded_creds = base64.b64encode(raw_creds.encode()).decode()
-        else:
-            # Assume already base64 encoded
-            print(f"Credentials appear to be pre-encoded (length: {len(raw_creds)})")
-            _encoded_creds = raw_creds
-        
-        print(f"Encoded credentials ready (length: {len(_encoded_creds)})")
-        return _encoded_creds
-    except Exception as e:
-        print(f"ERROR: Failed to get credentials from Secret Manager: {e}")
-        raise
+
+    raw_creds = get_secret('gong-api-key')
+    if ':' in raw_creds and not raw_creds.startswith('eyJ'):
+        _encoded_creds = base64.b64encode(raw_creds.encode()).decode()
+    else:
+        _encoded_creds = raw_creds
+    return _encoded_creds
 
 
 def get_headers():
-    """Get headers for Gong API requests."""
-    encoded_creds = get_encoded_credentials()
-    headers = {
-        "Authorization": f"Basic {encoded_creds}",
-        "Content-Type": "application/json"
+    return {
+        "Authorization": f"Basic {get_encoded_credentials()}",
+        "Content-Type": "application/json",
     }
-    print(f"Authorization header set (length: {len(headers['Authorization'])})")
-    return headers
 
 
 def get_calls_since(hours_ago=24):

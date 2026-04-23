@@ -1,8 +1,21 @@
+# See slack-sync/.gcloudignore for why this file is standalone.
 .gcloudignore
 .git
 .gitignore
+
 __pycache__/
 *.pyc
 *.pyo
+
 .env
+.env.*
+
 *.md
+
+node_modules/
+.DS_Store
+
+deploy.sh
+
+# Force-include shared/, which deploy.sh rsyncs in at deploy time.
+!shared/
