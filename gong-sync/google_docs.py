@@ -18,6 +18,23 @@ def get_docs_client():
     return _docs_client
 
 
+def get_doc_text(doc_id):
+    """Read all text content from a Google Doc for deduplication."""
+    docs = get_docs_client()
+    doc = docs.documents().get(documentId=doc_id).execute()
+
+    text_parts = []
+    for element in doc.get('body', {}).get('content', []):
+        paragraph = element.get('paragraph')
+        if paragraph:
+            for run in paragraph.get('elements', []):
+                text_run = run.get('textRun')
+                if text_run:
+                    text_parts.append(text_run.get('content', ''))
+
+    return ''.join(text_parts)
+
+
 def append_to_doc(doc_id, content):
     """Append content to the end of a Google Doc."""
     docs = get_docs_client()

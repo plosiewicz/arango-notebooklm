@@ -5,8 +5,10 @@ Supports backfill mode for historical calls.
 """
 import json
 import os
+import time as _time
 from datetime import datetime, timedelta
 
+from google.cloud import storage
 from gong_api import (
     get_calls_since,
     get_calls_in_range,
@@ -15,13 +17,48 @@ from gong_api import (
     format_transcript,
     get_account_info_from_call
 )
-from google_docs import append_to_doc, format_call_for_doc
+from google_docs import append_to_doc, format_call_for_doc, get_doc_text
 
 
-# Load account mapping
-# Keys can be either Account IDs (preferred) or Account Names (fallback)
-with open('account-mapping.json', 'r') as f:
-    account_mapping = json.load(f)
+# GCS config for account mapping
+GCS_BUCKET = os.environ.get('CONFIG_BUCKET', 'slack-notebooklm-config')
+GCS_MAPPING_BLOB = 'account-mapping.json'
+
+# Mapping cache (refreshed every 5 minutes)
+_mapping_cache = None
+_mapping_loaded_at = 0
+CACHE_TTL = 300  # 5 minutes
+
+
+def get_account_mapping():
+    """Load account mapping from GCS with 5-minute cache."""
+    global _mapping_cache, _mapping_loaded_at
+
+    if _mapping_cache and (_time.time() - _mapping_loaded_at < CACHE_TTL):
+        return _mapping_cache
+
+    try:
+        client = storage.Client()
+        bucket = client.bucket(GCS_BUCKET)
+        blob = bucket.blob(GCS_MAPPING_BLOB)
+        _mapping_cache = json.loads(blob.download_as_text())
+        _mapping_loaded_at = _time.time()
+        print(f"Loaded account mapping from GCS ({len(_mapping_cache)} accounts)")
+        return _mapping_cache
+    except Exception as e:
+        print(f"Error loading account mapping from GCS: {e}")
+        # Fall back to local file if GCS fails
+        if _mapping_cache:
+            print("Using stale cache")
+            return _mapping_cache
+        try:
+            with open('account-mapping.json', 'r') as f:
+                _mapping_cache = json.load(f)
+                _mapping_loaded_at = _time.time()
+                print("Fell back to local account-mapping.json")
+                return _mapping_cache
+        except Exception:
+            return {}
 
 # Track processed calls to avoid duplicates (in production, use a database)
 processed_calls_file = '/tmp/processed_gong_calls.json'
@@ -50,6 +87,8 @@ def find_mapping_for_account(account_id, account_name):
     Find the mapping for an account by ID or name.
     Tries ID first (more reliable), then falls back to name.
     """
+    account_mapping = get_account_mapping()
+
     # Try exact match on account ID
     if account_id and account_id in account_mapping:
         return account_mapping[account_id]
@@ -67,13 +106,14 @@ def find_mapping_for_account(account_id, account_name):
     return None
 
 
-def process_calls(calls, skip_processed=True):
+def process_calls(calls, skip_processed=True, account_filter=None):
     """
     Process a list of calls - fetch details, transcripts, and sync to docs.
     
     Args:
         calls: List of call objects from Gong API
         skip_processed: Whether to skip already processed calls
+        account_filter: Optional account key (email domain, name, or ID) to process only
     
     Returns:
         Tuple of (processed_count, errors_list, skipped_accounts)
@@ -119,8 +159,10 @@ def process_calls(calls, skip_processed=True):
         print(f"  DEBUG Raw call {i}: {c}")
     
     processed_count = 0
+    skipped_dupes = 0
     errors = []
     skipped_accounts = {}  # Track accounts with no mapping
+    doc_text_cache = {}  # Cache of existing doc text per doc_id for dedup
     
     # Debug: Log first 3 call details to understand data structure
     debug_count = 0
@@ -146,6 +188,16 @@ def process_calls(calls, skip_processed=True):
             if not account_id and not account_name:
                 print(f"Could not determine account for call {call_id}, skipping")
                 continue
+
+            # If filtering by account, skip non-matching calls silently
+            if account_filter:
+                filter_lower = account_filter.lower()
+                match = (
+                    (account_id and account_id.lower() == filter_lower) or
+                    (account_name and account_name.lower() == filter_lower)
+                )
+                if not match:
+                    continue
             
             # Look up the Google Doc for this account
             mapping = find_mapping_for_account(account_id, account_name)
@@ -158,7 +210,35 @@ def process_calls(calls, skip_processed=True):
                 continue
             
             doc_id = mapping.get("docId")
-            
+
+            # Load existing doc text for dedup (cached per doc)
+            if doc_id not in doc_text_cache:
+                try:
+                    doc_text_cache[doc_id] = get_doc_text(doc_id)
+                    print(f"Cached doc text for {doc_id} ({len(doc_text_cache[doc_id])} chars)")
+                except Exception as e:
+                    print(f"Could not read doc {doc_id} for dedup, proceeding without: {e}")
+                    doc_text_cache[doc_id] = ""
+
+            # Build dedup key from call title + date
+            call_title = details.get("metaData", {}).get("title", "Untitled Call")
+            call_started = details.get("metaData", {}).get("started", "")
+            if call_started:
+                try:
+                    from datetime import datetime as _dt
+                    _d = _dt.fromisoformat(call_started.replace("Z", "+00:00"))
+                    dedup_date = _d.strftime("%B %d, %Y at %I:%M %p")
+                except Exception:
+                    dedup_date = call_started
+            else:
+                dedup_date = ""
+
+            dedup_key = f"GONG CALL: {call_title}"
+            if dedup_key in doc_text_cache[doc_id] and dedup_date and dedup_date in doc_text_cache[doc_id]:
+                print(f"Skipping duplicate call '{call_title}' already in doc {doc_id}")
+                skipped_dupes += 1
+                continue
+
             # Get transcript
             transcript_entries = get_transcript(call_id)
             
@@ -186,6 +266,9 @@ def process_calls(calls, skip_processed=True):
             
             # Append to Google Doc
             append_to_doc(doc_id, doc_content)
+
+            # Update cached doc text so later calls in this run also dedup
+            doc_text_cache[doc_id] += doc_content
             
             print(f"Successfully synced call '{call_info['title']}' for '{account_name}'")
             processed_calls.add(call_id)
@@ -199,7 +282,10 @@ def process_calls(calls, skip_processed=True):
     # Save processed calls
     save_processed_calls(processed_calls)
     
-    return (processed_count, errors, skipped_accounts)
+    if skipped_dupes:
+        print(f"Skipped {skipped_dupes} duplicate calls already in docs")
+
+    return (processed_count, errors, skipped_accounts, skipped_dupes)
 
 
 def gong_sync(request):
@@ -210,14 +296,18 @@ def gong_sync(request):
     - backfill: Set to 'true' to enable backfill mode
     - days: Number of days to backfill (default: 90)
     - hours: For regular sync, hours to look back (default: 25)
+    - account: Optional account filter (email domain, name, or ID) to process only one account
     """
     # Parse query parameters
     args = request.args if hasattr(request, 'args') else {}
     
     backfill_mode = args.get('backfill', 'false').lower() == 'true'
+    account_filter = args.get('account', '').strip() or None
     
     print(f"Starting Gong sync at {datetime.utcnow().isoformat()}")
     print(f"Backfill mode: {backfill_mode}")
+    if account_filter:
+        print(f"Account filter: {account_filter}")
     
     if backfill_mode:
         # Backfill mode - get historical calls
@@ -244,11 +334,12 @@ def gong_sync(request):
     print(f"Found {len(calls)} calls to process")
     
     # Process the calls
-    processed_count, errors, skipped_accounts = process_calls(calls, skip_processed)
+    processed_count, errors, skipped_accounts, skipped_dupes = process_calls(calls, skip_processed, account_filter)
     
     result = {
         "message": f"Processed {processed_count} calls",
         "processed": processed_count,
+        "skipped_dupes": skipped_dupes,
         "total_found": len(calls),
         "skipped_accounts": skipped_accounts if skipped_accounts else None,
         "errors": errors if errors else None
