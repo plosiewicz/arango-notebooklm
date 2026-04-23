@@ -27,8 +27,21 @@ from gong_api import (
 )
 from shared.gcs_mapping import load_mapping
 from shared.google_docs import append_to_doc, get_doc_text
+from shared.sheets import batch_update_values, get_column_letter, read_tab
 
 MAPPING_BLOB = 'account-mapping.json'
+
+# Onboarding sheet: same sheet config-sync reads to build the
+# account-mapping.json blob. We only write the 'Calls scraped' column.
+SHEET_ID = '1p8CZ5RBGkFSf6aPnUIz8DXai9_UgNZhj7g1JtbPMvzI'
+GONG_TAB = 'gong'
+CALLS_SCRAPED_COLUMN = 'Calls scraped'
+
+# Distinctive three-line prefix that gong-sync itself writes at the top
+# of every call block (see format_call_for_doc). Anchored with the
+# preceding newline + separator so a bare "GONG CALL: ..." line inside
+# a transcript can't inflate the count.
+HEADER_PREFIX = "\n=====================================\nGONG CALL: "
 
 
 def get_account_mapping():
@@ -105,10 +118,13 @@ def process_calls(calls, account_filter=None):
     for the call's header line). `account_filter` restricts processing
     to a single account - non-matching calls are silently skipped.
 
-    Returns (processed_count, errors, skipped_accounts, skipped_dupes).
+    Returns (processed_count, errors, skipped_accounts, skipped_dupes,
+    doc_text_cache). The cache maps doc_id -> final doc text as of
+    end-of-run; the caller uses it to update the 'Calls scraped'
+    column without re-reading the docs.
     """
     if not calls:
-        return (0, [], {}, 0)
+        return (0, [], {}, 0, {})
 
     print(f"Processing {len(calls)} calls" + (f" (filter: {account_filter})" if account_filter else ""))
 
@@ -213,7 +229,7 @@ def process_calls(calls, account_filter=None):
     if skipped_dupes:
         print(f"Skipped {skipped_dupes} duplicate calls already in docs")
 
-    return (processed_count, errors, skipped_accounts, skipped_dupes)
+    return (processed_count, errors, skipped_accounts, skipped_dupes, doc_text_cache)
 
 
 def gong_sync(request):
@@ -251,7 +267,16 @@ def gong_sync(request):
 
     print(f"Found {len(calls)} calls to process")
 
-    processed_count, errors, skipped_accounts, skipped_dupes = process_calls(calls, account_filter)
+    processed_count, errors, skipped_accounts, skipped_dupes, doc_text_cache = process_calls(
+        calls, account_filter,
+    )
+
+    try:
+        _write_calls_scraped_column(doc_text_cache)
+    except Exception as e:
+        # Don't fail the sync if the sheet write fails - the next run
+        # will recompute the absolute count. Just log and carry on.
+        print(f"Error writing 'Calls scraped' column: {e}")
 
     result = {
         "message": f"Processed {processed_count} calls",
@@ -264,6 +289,59 @@ def gong_sync(request):
 
     print(f"Gong sync complete: {result}")
     return result, 200
+
+
+def _write_calls_scraped_column(doc_text_cache):
+    """Set 'Calls scraped' on the gong tab to the number of GONG CALL
+    headers currently in each doc we touched this run.
+
+    Idempotent by construction: always writes the absolute count
+    derived from the doc text, never a delta. Silent no-op if the
+    column header isn't on the sheet or if the cache is empty.
+
+    Cold accounts (rows whose doc wasn't touched this run) are
+    skipped - doc_text_cache only contains docs we actually read, so
+    for untouched docs we don't have a verified count.
+    """
+    if not doc_text_cache:
+        return
+
+    counts_by_doc = {
+        doc_id: text.count(HEADER_PREFIX)
+        for doc_id, text in doc_text_cache.items()
+    }
+
+    mapping = get_account_mapping()
+
+    rows = read_tab(SHEET_ID, GONG_TAB)
+    if not rows:
+        return
+
+    headers = [h for h in rows[0].keys() if h != '_row_index']
+    col = get_column_letter(headers, CALLS_SCRAPED_COLUMN)
+    if not col:
+        print(
+            f"Sheet has no '{CALLS_SCRAPED_COLUMN}' column; skipping write. "
+            "Add the column header to the gong tab to enable this feature."
+        )
+        return
+
+    updates = []
+    for row in rows:
+        key = row.get('customer-email-domain', '').strip()
+        if not key:
+            continue
+        entry = mapping.get(key)
+        if not entry:
+            continue
+        doc_id = entry.get('docId')
+        if doc_id not in counts_by_doc:
+            continue
+        updates.append((f"{GONG_TAB}!{col}{row['_row_index']}", counts_by_doc[doc_id]))
+
+    if updates:
+        batch_update_values(SHEET_ID, updates)
+        print(f"Updated '{CALLS_SCRAPED_COLUMN}' on {len(updates)} row(s)")
 
 
 if __name__ == '__main__':
