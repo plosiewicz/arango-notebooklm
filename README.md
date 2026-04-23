@@ -1,22 +1,68 @@
 # NotebookLM Sync
 
-Syncs customer context from Slack and Gong into Google Docs, which feed into NotebookLM as sources.
+**Internal ArangoDB use only. Not for external distribution.**
 
-Two independent Cloud Functions:
-- **slack-sync** — Real-time. Slack messages are appended to a Google Doc as they come in.
-- **gong-sync** — Scheduled. Gong call transcripts are pulled daily and appended to a Google Doc.
+Syncs customer context from Slack and Gong into per-customer Google
+Docs, which are then attached as sources in NotebookLM notebooks.
 
-Both run in the `slack-notebooklm-sync` GCP project in `us-central1`.
+Three Cloud Functions, all in GCP project `slack-notebooklm-sync`
+(`us-central1`):
+
+| Service | Trigger | What it does |
+|---|---|---|
+| `slack-sync` | Slack webhook + ad-hoc `?backfill=true` | Appends new Slack messages to the mapped Google Doc; also handles historical backfills. |
+| `gong-sync` | Cloud Scheduler (hourly) + ad-hoc | Pulls recent Gong calls, dedups against each customer doc, appends transcript + summary. |
+| `config-sync` | Cloud Scheduler (hourly) | Reads the customer-onboarding Google Sheet, updates the GCS mapping blobs, triggers a backfill for any brand-new rows. |
+
+See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full picture of how
+data flows between them.
+
+---
+
+## Repo layout
+
+```
+.
+├── README.md
+├── ARCHITECTURE.md
+├── CONTRIBUTING.md
+├── deploy.sh                  root dispatcher (./deploy.sh slack|gong|config|all)
+├── shared/                    imported by every service
+│   ├── google_docs.py         get_docs_client, get_doc_text, append_to_doc
+│   ├── gcs_mapping.py         load_mapping, save_mapping (5 min cache)
+│   └── secrets.py             get_secret (Secret Manager wrapper)
+├── slack-sync/
+│   ├── main.py                webhook + backfill handler
+│   ├── requirements.txt
+│   ├── .gcloudignore
+│   └── deploy.sh
+├── gong-sync/
+│   ├── main.py                call processing + dedup
+│   ├── gong_api.py            Gong API client
+│   ├── requirements.txt
+│   ├── .gcloudignore
+│   └── deploy.sh
+└── config-sync/
+    ├── main.py                sheet → GCS + backfill orchestration
+    ├── requirements.txt
+    ├── .gcloudignore
+    └── deploy.sh
+```
+
+`shared/` is rsynced into each service directory at deploy time - the
+copies are gitignored and cleaned up after deploy. See
+[CONTRIBUTING.md](./CONTRIBUTING.md) for how local dev works.
 
 ---
 
 ## Prerequisites
 
-- `gcloud` CLI installed ([install guide](https://cloud.google.com/sdk/docs/install))
-- Access to the `slack-notebooklm-sync` GCP project
-- Slack credentials for slack-sync (ask Paul)
-
-Authenticate:
+- `gcloud` CLI authenticated as an ArangoDB Google account that has
+  access to the `slack-notebooklm-sync` project.
+- The GCP compute service account
+  (`399790122111-compute@developer.gserviceaccount.com`) needs:
+  - Secret Manager Secret Accessor
+  - editor access on every customer Google Doc
 
 ```bash
 gcloud auth login
@@ -25,229 +71,142 @@ gcloud config set project slack-notebooklm-sync
 
 ---
 
-## Slack Sync
+## Deploying
 
-### How It Works
-
-```
-Slack message → Cloud Function (HTTP webhook) → Google Doc → NotebookLM
-```
-
-Slack sends a webhook to the Cloud Function on every message in a subscribed channel. The function looks up the channel in `channel-mapping.json`, resolves the sender's display name via the Slack API, and appends the formatted message to the mapped Google Doc.
-
-Slack retries webhooks if it doesn't get a response within 3 seconds. The function detects retries via the `X-Slack-Retry-Num` header and drops them to prevent duplicate messages.
-
-### Secrets
-
-Slack credentials are passed as environment variables at deploy time. They live in `slack-sync/.env` (gitignored). Copy `.env.example` and fill in the values.
-
-| Variable | Where to find it |
-|---|---|
-| `SLACK_BOT_TOKEN` | [Slack App Settings](https://api.slack.com/apps) > OAuth & Permissions |
-| `SLACK_SIGNING_SECRET` | [Slack App Settings](https://api.slack.com/apps) > Basic Information |
-
-### Deploy
+One service:
 
 ```bash
-cd slack-sync
-source .env
-
-gcloud functions deploy slack-sync \
-  --gen2 \
-  --runtime python312 \
-  --trigger-http \
-  --allow-unauthenticated \
-  --entry-point slack_webhook \
-  --set-env-vars "SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN,SLACK_SIGNING_SECRET=$SLACK_SIGNING_SECRET" \
-  --source . \
-  --region us-central1
+./deploy.sh slack
+./deploy.sh gong
+./deploy.sh config
 ```
 
-### Adding a New Customer Channel
-
-1. Get the Slack channel ID (right-click channel > View channel details > scroll to bottom).
-2. Create a Google Doc (or use an existing one). Copy the Doc ID from the URL:
-   ```
-   https://docs.google.com/document/d/1aBcDeFgHiJkLmNoPqRs/edit
-                                      └──────────────────┘
-                                         This is the Doc ID
-   ```
-3. Share the Google Doc with `399790122111-compute@developer.gserviceaccount.com` as **Editor**.
-4. Add the channel to `slack-sync/channel-mapping.json`:
-   ```json
-   {
-     "C0ABC123XYZ": {
-       "docId": "your-google-doc-id",
-       "customerName": "Customer Name"
-     }
-   }
-   ```
-5. Redeploy (see above).
-6. Invite the bot to the channel: `/invite @NotebookLM Sync`
-7. Send a test message — it should appear in the Google Doc within a few seconds.
-8. (Optional) Add the Google Doc as a source in the customer's NotebookLM notebook.
-
-### Logs
+All three:
 
 ```bash
-gcloud functions logs read slack-sync --region us-central1 --limit 30 --project slack-notebooklm-sync
+./deploy.sh all
 ```
 
-### Troubleshooting
-
-| Problem | Fix |
-|---|---|
-| "No mapping found for channel" | Channel ID not in `channel-mapping.json`. Add it and redeploy. |
-| 403 "caller does not have permission" | Google Doc not shared with the service account. Share it as Editor. |
-| Messages not appearing | Is the bot in the channel? `/invite @NotebookLM Sync`. Check logs. |
-| "Invalid signature" | `SLACK_SIGNING_SECRET` doesn't match. Get the correct value and redeploy. |
-| Duplicate messages | The retry-detection logic should handle this. Check logs for "Ignoring Slack retry" entries. |
-| NotebookLM not updating | May take a few minutes. Try refreshing the notebook or re-adding the source. |
+Any trailing args pass through to `gcloud functions deploy`, so you
+can e.g. `./deploy.sh slack --update-env-vars=FOO=bar`.
 
 ---
 
-## Gong Sync
+## Secrets (GCP Secret Manager)
 
-### How It Works
+All three services pull credentials from Secret Manager via
+`shared/secrets.py`. There are no `.env` files.
 
-```
-Cloud Scheduler (daily) → Cloud Function → Gong API → Google Doc → NotebookLM
-```
-
-The function is triggered daily by Cloud Scheduler. It pulls recent calls from the Gong API, matches each call to an account using `account-mapping.json`, fetches the transcript and AI summary, and appends everything to the mapped Google Doc.
-
-Account matching works by:
-1. CRM context on the call (Salesforce/HubSpot account ID) — most reliable
-2. External participant's company name
-3. External participant's email domain (excluding generic providers like gmail.com)
-
-Duplicate calls are tracked in `/tmp/processed_gong_calls.json` on the function instance. This resets on cold starts, so the scheduled interval (daily) and lookback window (25 hours) are set to overlap slightly.
-
-### Secrets
-
-Gong API credentials are stored in **GCP Secret Manager**, not in environment variables or local files.
-
-| Secret | Path in Secret Manager |
-|---|---|
-| Gong API key | `projects/slack-notebooklm-sync/secrets/gong-api-key/versions/latest` |
-
-The secret value should be in `accessKeyId:accessKeySecret` format. The function base64-encodes it at runtime for the Gong API's Basic Auth.
-
-The function's service account (`399790122111-compute@developer.gserviceaccount.com`) needs the **Secret Manager Secret Accessor** role to read it. This is already configured.
-
-To view or update the secret:
-
-```bash
-# View the current secret value
-gcloud secrets versions access latest --secret=gong-api-key --project=slack-notebooklm-sync
-
-# Add a new version
-echo -n "newAccessKeyId:newAccessKeySecret" | \
-  gcloud secrets versions add gong-api-key --data-file=- --project=slack-notebooklm-sync
-```
-
-### Deploy
-
-```bash
-cd gong-sync
-
-gcloud functions deploy gong-sync \
-  --gen2 \
-  --runtime python312 \
-  --trigger-http \
-  --allow-unauthenticated \
-  --entry-point gong_sync \
-  --source . \
-  --region us-central1
-```
-
-No `--set-env-vars` needed — credentials come from Secret Manager.
-
-### Adding a New Customer Account
-
-1. Create a Google Doc for the customer. Copy the Doc ID from the URL.
-2. Share the Google Doc with `399790122111-compute@developer.gserviceaccount.com` as **Editor**.
-3. Add the account to `gong-sync/account-mapping.json`. The key can be an account ID, account name, or email domain — whatever matches how Gong identifies the account on calls:
-   ```json
-   {
-     "cadence.com": {
-       "docId": "your-google-doc-id",
-       "customerName": "Cadence Design Systems, Inc."
-     }
-   }
-   ```
-4. Redeploy (see above).
-
-### Manual Trigger and Backfill
-
-The function accepts query parameters:
-
-| Parameter | Default | Description |
+| Secret | Used by | Format |
 |---|---|---|
-| `hours` | `25` | How many hours back to look for calls (normal mode) |
-| `backfill` | `false` | Set to `true` to pull historical calls |
-| `days` | `90` | How many days back to pull in backfill mode |
+| `gong-api-key` | gong-sync | `accessKeyId:accessKeySecret` |
+| `slack-bot-token` | slack-sync, config-sync | `xoxb-...` |
+| `slack-signing-secret` | slack-sync | hex string |
 
-Normal run (last 25 hours):
-```bash
-curl "https://us-central1-slack-notebooklm-sync.cloudfunctions.net/gong-sync"
-```
-
-Backfill last 90 days:
-```bash
-curl "https://us-central1-slack-notebooklm-sync.cloudfunctions.net/gong-sync?backfill=true&days=90"
-```
-
-### Logs
+View / rotate a secret:
 
 ```bash
-gcloud functions logs read gong-sync --region us-central1 --limit 30 --project slack-notebooklm-sync
+gcloud secrets versions access latest --secret=<name> --project=slack-notebooklm-sync
+
+echo -n "<new-value>" | \
+  gcloud secrets versions add <name> --data-file=- --project=slack-notebooklm-sync
 ```
 
-### Troubleshooting
-
-| Problem | Fix |
-|---|---|
-| "Failed to get credentials from Secret Manager" | Service account may not have Secret Accessor role, or the secret doesn't exist. Check Secret Manager in GCP Console. |
-| "No mapping found for account" | The account name/ID/domain from Gong doesn't match any key in `account-mapping.json`. Check logs for the exact value Gong returns and add it. |
-| 403 on Google Doc | Doc not shared with the service account. Share as Editor. |
-| Calls not syncing for a customer | The account might be identified differently in Gong than expected. Check logs for "skipped_accounts" to see what Gong is returning. |
+A new version is picked up on the next cold start.
 
 ---
 
-## File Structure
+## Configuration (Google Sheet)
 
-```
-├── README.md
-├── .gitignore
-├── slack-sync/
-│   ├── main.py                 # Slack webhook handler
-│   ├── google_docs.py          # Google Docs API helper
-│   ├── channel-mapping.json    # Slack channel ID → Google Doc ID
-│   ├── requirements.txt        # Python dependencies
-│   ├── .env.example            # Template for local env vars
-│   ├── .gcloudignore           # Files excluded from deploy
-│   └── .gitignore              # Files excluded from git
-└── gong-sync/
-    ├── main.py                 # Cloud Function entry point + call processing
-    ├── gong_api.py             # Gong API client (calls, transcripts, auth)
-    ├── google_docs.py          # Google Docs API helper
-    ├── account-mapping.json    # Account name/domain → Google Doc ID
-    └── requirements.txt        # Python dependencies
+Customer onboarding lives in **one** Google Sheet:
+[NotebookLM customer config](https://docs.google.com/spreadsheets/d/1p8CZ5RBGkFSf6aPnUIz8DXai9_UgNZhj7g1JtbPMvzI).
+
+- `slack` tab: Slack Channel ID, Document ID, Customer Name,
+  `Config done (Y/N)`, (optional) `Backlog through`
+- `gong` tab: customer-email-domain, document-id, customer-name,
+  `Config done (Y/N)`, (optional) `backlog-through`
+
+Flow (runs hourly from config-sync):
+
+1. config-sync reads both tabs.
+2. Rebuilds the mapping JSON for each tab and writes it to the
+   `slack-notebooklm-config` GCS bucket
+   (`channel-mapping.json`, `account-mapping.json`).
+3. For each row where `Config done (Y/N)` is blank, config-sync
+   triggers a one-shot backfill on slack-sync (from `Backlog through`
+   or channel creation) or gong-sync (last N days since
+   `backlog-through`), then writes `Y` back into the sheet.
+
+slack-sync / gong-sync read the GCS mapping on every request with a
+5-minute in-memory cache.
+
+### Adding a new customer
+
+1. Create a Google Doc, share it with
+   `399790122111-compute@developer.gserviceaccount.com` as Editor.
+2. Add a row to the `slack` and/or `gong` tab with the doc ID. Leave
+   `Config done` blank.
+3. (Slack only) Invite `@NotebookLM Sync` to the channel.
+4. Wait up to an hour - or trigger config-sync manually:
+   ```bash
+   curl "https://us-central1-slack-notebooklm-sync.cloudfunctions.net/config-sync"
+   ```
+5. config-sync flips `Config done` to `Y` once the backfill is done.
+6. Add the Google Doc as a source in the customer's NotebookLM.
+
+---
+
+## Manual triggers & backfills
+
+```bash
+# slack-sync backfill for one channel (default oldest = Jan 1 2024)
+curl "https://us-central1-slack-notebooklm-sync.cloudfunctions.net/slack-sync?backfill=true&channel=C0ABC123XYZ"
+
+# gong-sync, last 2 hours (same as scheduler)
+curl "https://us-central1-slack-notebooklm-sync.cloudfunctions.net/gong-sync?hours=2"
+
+# gong-sync backfill, last 90 days, one account only
+curl "https://us-central1-slack-notebooklm-sync.cloudfunctions.net/gong-sync?backfill=true&days=90&account=cadence.com"
+
+# config-sync once
+curl "https://us-central1-slack-notebooklm-sync.cloudfunctions.net/config-sync"
 ```
 
 ---
 
-## Quick Reference
+## Logs
+
+```bash
+gcloud functions logs read slack-sync  --region=us-central1 --project=slack-notebooklm-sync --limit=30
+gcloud functions logs read gong-sync   --region=us-central1 --project=slack-notebooklm-sync --limit=30
+gcloud functions logs read config-sync --region=us-central1 --project=slack-notebooklm-sync --limit=30
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `No mapping found for channel X` | Row missing from sheet, or config-sync hasn't run yet | Add the row, then `curl` config-sync. |
+| `403` / `caller does not have permission` on a doc | Doc not shared with the service account | Share the doc with `399790122111-compute@developer.gserviceaccount.com` as Editor. |
+| `Invalid signature` on slack-sync | `slack-signing-secret` doesn't match the Slack app | Copy from Slack app "Basic Information", add a new version to `slack-signing-secret`. |
+| `Failed to get credentials from Secret Manager` | Service account lacks Secret Accessor, or the secret name doesn't exist | Grant role or create/rename the secret. |
+| gong-sync "skipped_accounts" in logs | Account on the call doesn't match any sheet row | Add the account (email domain, name, or CRM id) to the `gong` tab. |
+| Duplicate Slack messages | Slack retried before the function returned 200 | Verified dedup: function drops `X-Slack-Retry-Num` headers. Check logs. |
+| NotebookLM source not updating | Doc updated, but NotebookLM cache | Re-index in NotebookLM UI. |
+
+---
+
+## Quick reference
 
 | Item | Value |
 |---|---|
-| GCP Project | `slack-notebooklm-sync` |
+| GCP project | `slack-notebooklm-sync` |
 | Region | `us-central1` |
-| Service Account | `399790122111-compute@developer.gserviceaccount.com` |
-| Slack Function URL | `https://us-central1-slack-notebooklm-sync.cloudfunctions.net/slack-sync` |
-| Gong Function URL | `https://us-central1-slack-notebooklm-sync.cloudfunctions.net/gong-sync` |
-| Slack App | `NotebookLM Sync` ([settings](https://api.slack.com/apps)) |
-| Gong API Secret | `projects/slack-notebooklm-sync/secrets/gong-api-key` |
-| GCP Console (slack-sync) | [Link](https://console.cloud.google.com/functions/details/us-central1/slack-sync?project=slack-notebooklm-sync) |
-| GCP Console (gong-sync) | [Link](https://console.cloud.google.com/functions/details/us-central1/gong-sync?project=slack-notebooklm-sync) |
+| Runtime service account | `399790122111-compute@developer.gserviceaccount.com` |
+| Config GCS bucket | `slack-notebooklm-config` |
+| Onboarding sheet | `1p8CZ5RBGkFSf6aPnUIz8DXai9_UgNZhj7g1JtbPMvzI` |
+| slack-sync URL | `https://us-central1-slack-notebooklm-sync.cloudfunctions.net/slack-sync` |
+| gong-sync URL | `https://us-central1-slack-notebooklm-sync.cloudfunctions.net/gong-sync` |
+| config-sync URL | `https://us-central1-slack-notebooklm-sync.cloudfunctions.net/config-sync` |
