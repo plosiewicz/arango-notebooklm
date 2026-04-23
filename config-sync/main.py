@@ -1,50 +1,39 @@
-"""
-Config Sync Cloud Function.
-Reads the Google Sheet daily, updates channel/account mappings in GCS,
-triggers backfill for new entries, and marks rows as done.
+"""Config-sync Cloud Function.
+
+Runs hourly. For each row in the customer onboarding Google Sheet:
+  1. Push channel/account -> doc mappings into the GCS config bucket
+     so slack-sync and gong-sync pick them up on their next cache miss.
+  2. For rows not yet flagged done, trigger a backfill on the relevant
+     sync service and mark the row done.
 """
 import json
 import os
-import time
 from datetime import datetime
 
 import requests as http_requests
-from google.cloud import storage
 from googleapiclient.discovery import build
 
-# Google Sheet config
+from shared.gcs_mapping import load_mapping, save_mapping
+from shared.secrets import get_secret
+
 SHEET_ID = '1p8CZ5RBGkFSf6aPnUIz8DXai9_UgNZhj7g1JtbPMvzI'
 SLACK_TAB = 'slack'
 GONG_TAB = 'gong'
 
-# GCS config
-GCS_BUCKET = os.environ.get('CONFIG_BUCKET', 'slack-notebooklm-config')
-
-# Cloud Function URLs
 SLACK_SYNC_URL = 'https://us-central1-slack-notebooklm-sync.cloudfunctions.net/slack-sync'
 GONG_SYNC_URL = 'https://us-central1-slack-notebooklm-sync.cloudfunctions.net/gong-sync'
-
-# Slack Bot Token (needed for conversations.info to get channel creation date)
-SLACK_BOT_TOKEN = os.environ.get('SLACK_BOT_TOKEN', '')
 
 # Jan 1, 2024 00:00:00 UTC as Unix timestamp
 JAN_1_2024_TS = 1704067200
 
-# Sheets API client (lazy)
 _sheets_client = None
 
 
 def get_sheets_client():
-    """Get authenticated Google Sheets client."""
     global _sheets_client
     if _sheets_client is None:
         _sheets_client = build('sheets', 'v4')
     return _sheets_client
-
-
-def get_gcs_client():
-    """Get GCS client."""
-    return storage.Client()
 
 
 def read_sheet_tab(tab_name):
@@ -82,30 +71,6 @@ def write_cell(tab_name, cell_ref, value):
     ).execute()
 
 
-def load_mapping_from_gcs(blob_name):
-    """Load a JSON mapping file from GCS. Returns empty dict if not found."""
-    try:
-        client = get_gcs_client()
-        bucket = client.bucket(GCS_BUCKET)
-        blob = bucket.blob(blob_name)
-        return json.loads(blob.download_as_text())
-    except Exception as e:
-        print(f"Could not load {blob_name} from GCS: {e}")
-        return {}
-
-
-def save_mapping_to_gcs(blob_name, mapping):
-    """Save a JSON mapping file to GCS."""
-    client = get_gcs_client()
-    bucket = client.bucket(GCS_BUCKET)
-    blob = bucket.blob(blob_name)
-    blob.upload_from_string(
-        json.dumps(mapping, indent=2),
-        content_type='application/json'
-    )
-    print(f"Uploaded {blob_name} to GCS ({len(mapping)} entries)")
-
-
 def get_column_letter(headers, column_name):
     """Get the spreadsheet column letter (A, B, C...) for a given header name."""
     try:
@@ -116,15 +81,17 @@ def get_column_letter(headers, column_name):
 
 
 def get_slack_channel_created_ts(channel_id):
-    """Get the creation timestamp of a Slack channel via conversations.info."""
-    if not SLACK_BOT_TOKEN:
-        print("No SLACK_BOT_TOKEN set, cannot get channel creation date")
+    """Return the Slack channel's `created` unix ts via conversations.info, or None."""
+    try:
+        token = get_secret('slack-bot-token')
+    except Exception as e:
+        print(f"Could not fetch slack-bot-token from Secret Manager: {e}")
         return None
 
     try:
         resp = http_requests.get(
             'https://slack.com/api/conversations.info',
-            headers={'Authorization': f'Bearer {SLACK_BOT_TOKEN}'},
+            headers={'Authorization': f'Bearer {token}'},
             params={'channel': channel_id},
             timeout=10,
         )
@@ -212,7 +179,7 @@ def process_slack_tab():
     headers = [h for h in headers if h != '_row_index']
 
     # Load current mapping from GCS
-    current_mapping = load_mapping_from_gcs('channel-mapping.json')
+    current_mapping = load_mapping('channel-mapping.json')
 
     # Build new mapping and find new entries
     new_mapping = {}
@@ -241,7 +208,7 @@ def process_slack_tab():
 
     # Upload updated mapping if it changed
     if new_mapping != current_mapping:
-        save_mapping_to_gcs('channel-mapping.json', new_mapping)
+        save_mapping('channel-mapping.json', new_mapping)
         print(f"Updated channel mapping: {len(current_mapping)} -> {len(new_mapping)} channels")
     else:
         print("Channel mapping unchanged")
@@ -313,7 +280,7 @@ def process_gong_tab():
     headers = [h for h in headers if h != '_row_index']
 
     # Load current mapping from GCS
-    current_mapping = load_mapping_from_gcs('account-mapping.json')
+    current_mapping = load_mapping('account-mapping.json')
 
     # Build new mapping and find new entries
     new_mapping = {}
@@ -342,7 +309,7 @@ def process_gong_tab():
 
     # Upload updated mapping if it changed
     if new_mapping != current_mapping:
-        save_mapping_to_gcs('account-mapping.json', new_mapping)
+        save_mapping('account-mapping.json', new_mapping)
         print(f"Updated account mapping: {len(current_mapping)} -> {len(new_mapping)} accounts")
     else:
         print("Account mapping unchanged")
