@@ -143,15 +143,33 @@ Why three separate things (pytest + ruff + shellcheck):
 - Service code lives under aliases - take the matching fixture from
   `tests/conftest.py` (`slack_main`, `gong_main`, `gong_api`,
   `config_main`) rather than a bare `import main`.
-- `shared.secrets.get_secret` and `shared.gcs_mapping._get_client` are
-  poisoned by the autouse `_no_real_io` fixture. Any test that needs
-  them must patch the specific binding it uses - e.g.
+- `shared.secrets.get_secret`, `shared.gcs_mapping._get_client`, and
+  `shared.sheets.get_sheets_client` are poisoned by the autouse
+  `_no_real_io` fixture. Any test that needs them must patch the
+  specific binding it uses - e.g.
   `monkeypatch.setattr(slack_main, "get_secret", ...)` because the
   service does `from shared.secrets import get_secret` which creates
-  a local binding.
+  a local binding. Same applies to `read_tab` / `batch_update_values`
+  / `write_cell` in service modules that import from `shared.sheets`.
 - Keep tests pure: no real network, no real GCS, no real Secret
   Manager. Orchestration-level tests for `process_*` remain out of
   scope until we next need them.
+
+## Onboarding sheet columns
+
+Most columns on the `slack` and `gong` tabs are humans-write,
+config-sync-reads. Exceptions:
+
+- `Config done (Y/N)` (both tabs) - config-sync writes `Y` after a
+  successful one-shot backfill. Humans can pre-populate it to opt a
+  row out of backfill (it's treated as already-handled).
+- `Calls scraped` (`gong` tab) - gong-sync writes the absolute number
+  of `GONG CALL:` header blocks currently in each customer's doc on
+  every run that touches that doc. Hand-edits are overwritten on the
+  next sync. If the column is missing from the tab, gong-sync logs
+  once and no-ops; add the header to enable writeback. Safe to add
+  at any time - there's no schema migration, the value fills in on
+  the next run.
 
 ## Style
 

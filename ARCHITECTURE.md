@@ -70,7 +70,7 @@ each service directory at deploy time.
 
 ### `shared/`
 
-Three tiny helpers every service depends on:
+Four tiny helpers every service depends on:
 
 - `shared.google_docs` - `get_docs_client()`, `get_doc_text(doc_id)`,
   `append_to_doc(doc_id, content)`. Google Docs API client cached in
@@ -82,6 +82,12 @@ Three tiny helpers every service depends on:
 - `shared.secrets` - `get_secret(name)` wrapping Secret Manager with
   in-process caching. Every credential comes from here - there are no
   `.env` files and no secret env vars on the functions.
+- `shared.sheets` - `read_tab(sheet_id, tab)`, `write_cell(sheet_id,
+  tab, cell_ref, value)`, `get_column_letter(headers, name)`,
+  `batch_update_values(sheet_id, updates)`. Thin wrapper around the
+  Sheets v4 Discovery client with a module-level client cache.
+  config-sync reads + single-cell writes; gong-sync batch-writes the
+  `Calls scraped` column.
 
 Because Cloud Functions can't import from a sibling path, each service's
 `deploy.sh` does `rsync -a --delete ../shared/ ./shared/` before running
@@ -141,6 +147,17 @@ Both modes converge on `process_calls`, which:
    runs.
 6. Fetches the transcript (`/v2/calls/transcript`), formats it, and
    appends the whole block (header + AI summary + transcript).
+7. After all appends complete, counts the three-line `GONG CALL:`
+   header prefix in each cached doc text and batch-writes the absolute
+   value to the `Calls scraped` column on the gong tab
+   (`_write_calls_scraped_column`). Idempotent, concurrency-safe, and
+   auto-backfills existing calls on first touch because the count is
+   derived from the doc's current text, not a delta. Silent no-op if
+   the column header is missing from the sheet. Note: if
+   `gong-sync` short-circuits at the top because Gong returned zero
+   calls in the lookback window, this step is skipped entirely that
+   run - dormant customers' counts stay at whatever the last non-quiet
+   run wrote.
 
 There is no instance-local state file - the old
 `/tmp/processed_gong_calls.json` didn't persist across instances and
@@ -215,9 +232,15 @@ tabs:
 - `slack` - `Slack Channel ID`, `Document ID`, `Customer Name`,
   `Config done (Y/N)`, optional `Backlog through`.
 - `gong` - `customer-email-domain`, `document-id`, `customer-name`,
-  `Config done (Y/N)`, optional `backlog-through`.
+  `Config done (Y/N)`, optional `backlog-through`, and `Calls scraped`
+  (managed by gong-sync, do not hand-edit: overwritten on every run
+  that touches this customer's doc).
 
-Humans edit the sheet; config-sync does the rest.
+Humans edit the sheet; config-sync does the rest. The `Calls scraped`
+column is the exception - gong-sync batch-writes the absolute
+"GONG CALL:" header count on every run, so the cell is always a
+mirror of the doc's contents. If the header is missing from the tab,
+gong-sync logs and skips; add the header to enable the feature.
 
 ---
 
@@ -278,9 +301,10 @@ Pytest runs under `importlib.util.spec_from_file_location` loaders in
 have `main.py` and a naive `import main` would collide. Each service is
 loaded once per session under a distinct `sys.modules` alias
 (`slack_main`, `gong_main`, `gong_api`, `config_main`). An autouse
-fixture poisons `shared.secrets.get_secret` and
-`shared.gcs_mapping._get_client` so a forgotten mock surfaces loudly
-rather than making real network calls.
+fixture poisons `shared.secrets.get_secret`,
+`shared.gcs_mapping._get_client`, and `shared.sheets.get_sheets_client`
+so a forgotten mock surfaces loudly rather than making real network
+calls.
 
 What CI does **not** cover today (all Tier 2 candidates):
 
