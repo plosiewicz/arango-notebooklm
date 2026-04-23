@@ -27,10 +27,22 @@ data flows between them.
 ├── ARCHITECTURE.md
 ├── CONTRIBUTING.md
 ├── deploy.sh                  root dispatcher (./deploy.sh slack|gong|config|all)
+├── dev-requirements.txt       pytest + freezegun + ruff
+├── pytest.ini                 test discovery + scoped DeprecationWarning errors
+├── pyproject.toml             ruff config (F ruleset)
+├── .github/workflows/ci.yml   ruff + pytest + shellcheck on push/PR
 ├── shared/                    imported by every service
 │   ├── google_docs.py         get_docs_client, get_doc_text, append_to_doc
 │   ├── gcs_mapping.py         load_mapping, save_mapping (5 min cache)
 │   └── secrets.py             get_secret (Secret Manager wrapper)
+├── tests/                     pytest suite (Tier 0 + Tier 1)
+│   ├── conftest.py            per-service loaders + autouse no-real-IO
+│   ├── test_import_smoke.py
+│   ├── test_shared_gcs_mapping.py
+│   ├── test_config_sync_helpers.py
+│   ├── test_slack_sync_helpers.py
+│   ├── test_gong_sync_helpers.py
+│   └── test_gong_api_helpers.py
 ├── slack-sync/
 │   ├── main.py                webhook + backfill handler
 │   ├── requirements.txt
@@ -43,7 +55,7 @@ data flows between them.
 │   ├── .gcloudignore
 │   └── deploy.sh
 └── config-sync/
-    ├── main.py                sheet → GCS + backfill orchestration
+    ├── main.py                sheet -> GCS + backfill orchestration
     ├── requirements.txt
     ├── .gcloudignore
     └── deploy.sh
@@ -52,6 +64,11 @@ data flows between them.
 `shared/` is rsynced into each service directory at deploy time - the
 copies are gitignored and cleaned up after deploy. See
 [CONTRIBUTING.md](./CONTRIBUTING.md) for how local dev works.
+
+Automated tests live in [`tests/`](./tests) and run on every push and
+PR via [`.github/workflows/ci.yml`](.github/workflows/ci.yml). See the
+"Running tests" section of [CONTRIBUTING.md](./CONTRIBUTING.md#running-tests)
+to run them locally.
 
 ---
 

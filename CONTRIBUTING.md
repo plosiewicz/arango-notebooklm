@@ -100,6 +100,59 @@ Cloud Scheduler in the same project. If you change the hourly cadence,
 also revisit gong-sync's `hours` query param default (set to `2` to
 give one hour of overlap for safety).
 
+## Running tests
+
+The repo ships a small pytest suite plus static-analysis gates that run
+on every push and PR via [GitHub Actions](.github/workflows/ci.yml).
+Run the same checks locally before pushing:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r dev-requirements.txt
+pip install -r slack-sync/requirements.txt \
+            -r gong-sync/requirements.txt \
+            -r config-sync/requirements.txt
+TZ=UTC pytest
+ruff check .
+shellcheck deploy.sh slack-sync/deploy.sh gong-sync/deploy.sh config-sync/deploy.sh
+```
+
+Why `TZ=UTC`: one Slack helper (`format_timestamp`) pins a specific
+human-readable format used as a dedup key. The test pins the expected
+string; without `TZ=UTC` the conversion drifts by your local offset.
+Cloud Run containers are already UTC, so prod matches the test.
+
+Why three separate things (pytest + ruff + shellcheck):
+
+- **ruff** catches undefined-name bugs (`F821`) at AST time - the
+  regression class where someone drops `import json` and a call inside
+  a function body only blows up at runtime. Plain `import` smoke cannot
+  catch that because Python only resolves free names when the function
+  runs.
+- **pytest** covers the pure-helper contracts and the security-critical
+  Slack signature verification.
+- **shellcheck** catches quoting and unset-variable mistakes in the
+  deploy scripts. It does *not* catch control-flow bugs (a function
+  that forgets `shift` is valid shell); those remain candidates for a
+  later behavioral-test tier.
+
+### Adding a test
+
+- Put it under `tests/test_<thing>.py`.
+- Service code lives under aliases - take the matching fixture from
+  `tests/conftest.py` (`slack_main`, `gong_main`, `gong_api`,
+  `config_main`) rather than a bare `import main`.
+- `shared.secrets.get_secret` and `shared.gcs_mapping._get_client` are
+  poisoned by the autouse `_no_real_io` fixture. Any test that needs
+  them must patch the specific binding it uses - e.g.
+  `monkeypatch.setattr(slack_main, "get_secret", ...)` because the
+  service does `from shared.secrets import get_secret` which creates
+  a local binding.
+- Keep tests pure: no real network, no real GCS, no real Secret
+  Manager. Orchestration-level tests for `process_*` remain out of
+  scope until we next need them.
+
 ## Style
 
 - No secrets in code or env vars - only in Secret Manager.

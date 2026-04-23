@@ -252,6 +252,46 @@ share a doc don't double-append the second one.
 
 ---
 
+## Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push
+and PR to `master`. One job, three checks (runs them all even if an
+earlier one fails, so a single push surfaces every problem):
+
+1. **`ruff check .`** - Pyflakes-only (`F` ruleset). `F821` catches
+   undefined-name bugs at AST time. This is the check that would have
+   caught the live regression where `import json` was dropped from
+   `config-sync/main.py`: `json.dumps(...)` inside a function body
+   doesn't fail import, only runtime. Static analysis flags it.
+2. **`TZ=UTC pytest`** - runs the `tests/` suite: Tier 0 import-smoke
+   (each service's `main.py` imports cleanly, entry points callable)
+   plus Tier 1 unit tests for pure helpers (see the tree under
+   [tests/](tests)). `TZ=UTC` pins `slack-sync`'s `format_timestamp`
+   output so doc-dedup keys are stable. Cloud Run containers are
+   already UTC, so test results match prod behavior.
+3. **`shellcheck deploy.sh slack-sync/deploy.sh gong-sync/deploy.sh
+   config-sync/deploy.sh`** - catches quoting and unset-var mistakes
+   in the deploy scripts.
+
+Pytest runs under `importlib.util.spec_from_file_location` loaders in
+[`tests/conftest.py`](tests/conftest.py) because all three services
+have `main.py` and a naive `import main` would collide. Each service is
+loaded once per session under a distinct `sys.modules` alias
+(`slack_main`, `gong_main`, `gong_api`, `config_main`). An autouse
+fixture poisons `shared.secrets.get_secret` and
+`shared.gcs_mapping._get_client` so a forgotten mock surfaces loudly
+rather than making real network calls.
+
+What CI does **not** cover today (all Tier 2 candidates):
+
+- Orchestration code paths in `process_slack_tab` / `process_gong_tab`
+  / `process_calls`. The "unconditional mark-Y" regression lived here.
+- Behavioral tests of `deploy.sh` (argument forwarding, `shift`
+  correctness). Shellcheck is only a syntactic/style linter.
+- End-to-end tests against real Slack/Gong/GCS/Secret Manager.
+
+---
+
 ## Deploying
 
 `./deploy.sh slack|gong|config|all`. Each service's `deploy.sh`:

@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dev tooling
+        run: pip install -r dev-requirements.txt
+
+      # Service deps ship per-function, but tests need the union installed in
+      # one venv so `import slack_sdk`, `import googleapiclient` etc. resolve.
+      # First attempt: single resolver pass over all three pin sets.
+      # If this step fails on conflicting google-* pins, switch to three
+      # separate `pip install` invocations (each its own resolver run;
+      # pip upgrades in place so the last install wins). Do NOT flatten
+      # back into a single pip call if you saw a conflict.
+      - name: Install service deps (union resolve)
+        run: |
+          pip install \
+            -r slack-sync/requirements.txt \
+            -r gong-sync/requirements.txt \
+            -r config-sync/requirements.txt
+
+      - name: Ruff (undefined names, unused imports)
+        if: always()
+        run: ruff check .
+
+      - name: Pytest (Tier 0 + Tier 1)
+        if: always()
+        env:
+          TZ: UTC
+        run: pytest -v
+
+      - name: Shellcheck deploy scripts
+        if: always()
+        run: |
+          shellcheck \
+            deploy.sh \
+            slack-sync/deploy.sh \
+            gong-sync/deploy.sh \
+            config-sync/deploy.sh
