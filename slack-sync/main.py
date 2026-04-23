@@ -1,120 +1,119 @@
-import os
-import json
-import hmac
+"""Slack -> Google Docs sync Cloud Function.
+
+Two entry points, same handler:
+  POST /            Slack Events API webhook (new message -> append to doc)
+  GET  /?backfill=true&channel=<id>&oldest=<ts>
+                    One-shot backfill of historical messages for a channel.
+
+Channel -> doc routing comes from the GCS mapping blob (config-sync
+is the writer). Secrets come from GCP Secret Manager.
+"""
 import hashlib
+import hmac
+import json
+import os
 import time
 from datetime import datetime
+
 from slack_sdk import WebClient
-from google.cloud import storage
-from google_docs import append_message_to_doc, get_doc_text
 
-# GCS config for channel mapping
-GCS_BUCKET = os.environ.get('CONFIG_BUCKET', 'slack-notebooklm-config')
-GCS_MAPPING_BLOB = 'channel-mapping.json'
+from shared.gcs_mapping import load_mapping
+from shared.google_docs import append_to_doc, get_doc_text
+from shared.secrets import get_secret
 
-# Mapping cache (refreshed every 5 minutes)
-_mapping_cache = None
-_mapping_loaded_at = 0
-CACHE_TTL = 300  # 5 minutes
+MAPPING_BLOB = 'channel-mapping.json'
 
-# Initialize Slack client
-slack = WebClient(token=os.environ.get('SLACK_BOT_TOKEN'))
+_slack_client = None
+_user_cache = {}
 
-# Cache for user info to avoid repeated API calls
-user_cache = {}
+
+def get_slack_client():
+    """Lazily build the Slack client with the bot token from Secret Manager."""
+    global _slack_client
+    if _slack_client is None:
+        _slack_client = WebClient(token=get_secret('slack-bot-token'))
+    return _slack_client
 
 
 def get_channel_mapping():
-    """Load channel mapping from GCS with 5-minute cache."""
-    global _mapping_cache, _mapping_loaded_at
-
-    if _mapping_cache and (time.time() - _mapping_loaded_at < CACHE_TTL):
-        return _mapping_cache
-
-    try:
-        client = storage.Client()
-        bucket = client.bucket(GCS_BUCKET)
-        blob = bucket.blob(GCS_MAPPING_BLOB)
-        _mapping_cache = json.loads(blob.download_as_text())
-        _mapping_loaded_at = time.time()
-        print(f"Loaded channel mapping from GCS ({len(_mapping_cache)} channels)")
-        return _mapping_cache
-    except Exception as e:
-        print(f"Error loading channel mapping from GCS: {e}")
-        # Fall back to local file if GCS fails
-        if _mapping_cache:
-            print("Using stale cache")
-            return _mapping_cache
-        try:
-            with open('channel-mapping.json', 'r') as f:
-                _mapping_cache = json.load(f)
-                _mapping_loaded_at = time.time()
-                print("Fell back to local channel-mapping.json")
-                return _mapping_cache
-        except Exception:
-            return {}
+    return load_mapping(MAPPING_BLOB)
 
 
 def verify_slack_signature(request):
-    """Verify that the request came from Slack"""
+    """Return True iff the request HMAC matches our signing secret.
+
+    Uses Slack's v0 scheme with a 5 minute replay window. Any failure
+    (bad/missing headers, bad timestamp, bad signature, Secret Manager
+    miss) returns False - we never let a request through unauthenticated.
+    """
     signature = request.headers.get('X-Slack-Signature', '')
     timestamp = request.headers.get('X-Slack-Request-Timestamp', '')
     body = request.get_data(as_text=True)
 
-    # Check timestamp to prevent replay attacks (5 min window)
-    if abs(time.time() - int(timestamp)) > 300:
+    if not signature or not timestamp:
+        return False
+
+    try:
+        if abs(time.time() - int(timestamp)) > 300:
+            return False
+    except ValueError:
         return False
 
     sig_basestring = f'v0:{timestamp}:{body}'
     my_signature = 'v0=' + hmac.new(
-        os.environ.get('SLACK_SIGNING_SECRET', '').encode(),
+        get_secret('slack-signing-secret').encode(),
         sig_basestring.encode(),
-        hashlib.sha256
+        hashlib.sha256,
     ).hexdigest()
 
     return hmac.compare_digest(my_signature, signature)
 
 
 def get_user_name(user_id):
-    """Get user's display name from Slack"""
-    if user_id in user_cache:
-        return user_cache[user_id]
+    """Return the best available display name for a Slack user id, cached."""
+    if user_id in _user_cache:
+        return _user_cache[user_id]
 
     try:
-        result = slack.users_info(user=user_id)
+        result = get_slack_client().users_info(user=user_id)
         profile = result['user']['profile']
-        name = profile.get('display_name') or profile.get('real_name') or result['user'].get('name')
-        user_cache[user_id] = name
+        name = (
+            profile.get('display_name')
+            or profile.get('real_name')
+            or result['user'].get('name')
+        )
+        _user_cache[user_id] = name
         return name
     except Exception as e:
         print(f"Error fetching user {user_id}: {e}")
-        return user_id  # Fallback to user ID
+        return user_id
 
 
 def format_timestamp(ts):
-    """Format Slack timestamp for display"""
-    dt = datetime.fromtimestamp(float(ts))
-    return dt.strftime('%m/%d/%Y, %I:%M %p')
+    return datetime.fromtimestamp(float(ts)).strftime('%m/%d/%Y, %I:%M %p')
+
+
+def format_message(user_name, timestamp, text):
+    return f"[{timestamp}] {user_name}:\n{text}\n\n"
+
+
+def append_message_to_doc(doc_id, user_name, timestamp, text):
+    append_to_doc(doc_id, format_message(user_name, timestamp, text))
 
 
 def backfill_channel(channel_id, mapping, oldest_ts):
-    """
-    Backfill historical messages from a Slack channel into the Google Doc.
+    """Page through a channel's history and append new user messages to the doc.
 
-    Args:
-        channel_id: Slack channel ID
-        mapping: Dict with 'docId' and 'customerName'
-        oldest_ts: Unix timestamp string — fetch messages from this point forward
-
-    Returns:
-        Dict with backfill results
+    Dedups against the doc itself by looking for the "[ts] user:" header,
+    so reruns are idempotent. Batches all new messages into a single
+    append call.
     """
     doc_id = mapping['docId']
     customer_name = mapping['customerName']
+    slack = get_slack_client()
 
     print(f"Starting backfill for {customer_name} (channel {channel_id}) from {oldest_ts}")
 
-    # Read existing doc text for dedup
     try:
         existing_text = get_doc_text(doc_id)
         print(f"Read existing doc text ({len(existing_text)} chars)")
@@ -122,7 +121,6 @@ def backfill_channel(channel_id, mapping, oldest_ts):
         print(f"Could not read doc for dedup, proceeding without: {e}")
         existing_text = ""
 
-    # Fetch all messages from Slack using pagination
     all_messages = []
     cursor = None
 
@@ -140,18 +138,13 @@ def backfill_channel(channel_id, mapping, oldest_ts):
             result = slack.conversations_history(**kwargs)
             messages = result.get('messages', [])
             all_messages.extend(messages)
-
             print(f"Fetched {len(all_messages)} messages so far...")
 
-            # Check for more pages
-            response_metadata = result.get('response_metadata', {})
-            cursor = response_metadata.get('next_cursor')
+            cursor = result.get('response_metadata', {}).get('next_cursor')
             if not cursor:
                 break
 
-            # Small delay to respect rate limits
             time.sleep(0.5)
-
         except Exception as e:
             print(f"Error fetching history: {e}")
             break
@@ -160,16 +153,10 @@ def backfill_channel(channel_id, mapping, oldest_ts):
         print("No messages found in the specified range")
         return {"added": 0, "skipped": 0, "total_fetched": 0}
 
-    # Sort oldest first (conversations.history returns newest first)
     all_messages.sort(key=lambda m: float(m.get('ts', '0')))
-
-    print(f"Total messages fetched: {len(all_messages)}")
-
-    # Filter to only real user messages (no subtypes like join/leave/bot)
     user_messages = [m for m in all_messages if not m.get('subtype')]
-    print(f"User messages (excluding system/bot): {len(user_messages)}")
+    print(f"Total fetched: {len(all_messages)}, user messages: {len(user_messages)}")
 
-    # Build batch of new messages, deduplicating against existing doc text
     added = 0
     skipped = 0
     batch_text = []
@@ -186,39 +173,18 @@ def backfill_channel(channel_id, mapping, oldest_ts):
         user_name = get_user_name(user_id)
         timestamp = format_timestamp(ts)
 
-        # Dedup: check if this message's header line already exists in the doc
         dedup_key = f"[{timestamp}] {user_name}:"
         if dedup_key in existing_text:
             skipped += 1
             continue
 
-        formatted_message = f"[{timestamp}] {user_name}:\n{text}\n\n"
-        batch_text.append(formatted_message)
+        batch_text.append(format_message(user_name, timestamp, text))
         added += 1
 
     if batch_text:
-        # Batch-append all messages in a single API call
         full_text = ''.join(batch_text)
         print(f"Appending {added} messages ({len(full_text)} chars) to doc {doc_id}")
-
-        from google_docs import get_docs_client
-        docs = get_docs_client()
-        doc = docs.documents().get(documentId=doc_id).execute()
-        end_index = doc['body']['content'][-1]['endIndex'] - 1
-
-        docs.documents().batchUpdate(
-            documentId=doc_id,
-            body={
-                'requests': [
-                    {
-                        'insertText': {
-                            'location': {'index': end_index},
-                            'text': full_text
-                        }
-                    }
-                ]
-            }
-        ).execute()
+        append_to_doc(doc_id, full_text)
 
     result = {
         "channel": channel_id,
@@ -232,9 +198,7 @@ def backfill_channel(channel_id, mapping, oldest_ts):
 
 
 def handle_backfill(request):
-    """Handle a backfill request (GET ?backfill=true)."""
     args = request.args if hasattr(request, 'args') else {}
-
     channel_id = args.get('channel')
     # Default oldest: Jan 1 2024 00:00:00 UTC
     oldest_ts = args.get('oldest', '1704067200')
@@ -242,75 +206,55 @@ def handle_backfill(request):
     channel_mapping = get_channel_mapping()
 
     if channel_id:
-        # Backfill a specific channel
         mapping = channel_mapping.get(channel_id)
         if not mapping:
             return {"error": f"No mapping found for channel {channel_id}"}, 404
+        return backfill_channel(channel_id, mapping, oldest_ts), 200
 
-        result = backfill_channel(channel_id, mapping, oldest_ts)
-        return result, 200
-    else:
-        # Backfill all mapped channels
-        results = []
-        for ch_id, mapping in channel_mapping.items():
-            try:
-                result = backfill_channel(ch_id, mapping, oldest_ts)
-                results.append(result)
-            except Exception as e:
-                results.append({"channel": ch_id, "error": str(e)})
-        return {"results": results}, 200
+    results = []
+    for ch_id, mapping in channel_mapping.items():
+        try:
+            results.append(backfill_channel(ch_id, mapping, oldest_ts))
+        except Exception as e:
+            results.append({"channel": ch_id, "error": str(e)})
+    return {"results": results}, 200
 
 
 def slack_webhook(request):
-    """Main entry point for Google Cloud Functions.
+    """Cloud Function entry point.
 
-    Routes:
-    - GET with ?backfill=true → backfill handler
-    - POST → Slack webhook handler
+    GET ?backfill=true -> handle_backfill
+    GET (else)         -> health check
+    POST               -> Slack Events API webhook
     """
-    # Handle backfill requests (GET)
     if request.method == 'GET':
         args = request.args if hasattr(request, 'args') else {}
         if args.get('backfill', '').lower() == 'true':
             return handle_backfill(request)
         return 'Slack NotebookLM Sync is running.', 200
 
-    # --- Slack webhook handling (POST) ---
-
-    # Slack retries if it doesn't get a response within 3 seconds.
-    # Ignore retries to prevent duplicate messages.
+    # Slack retries if it doesn't see a 200 within 3s. Drop retries so we
+    # don't double-append the same message.
     retry_num = request.headers.get('X-Slack-Retry-Num')
     if retry_num:
         print(f'Ignoring Slack retry #{retry_num}')
         return 'OK', 200
 
-    # Parse the request body
     body = request.get_json(silent=True) or {}
-
-    # Log all incoming requests for debugging
     print(f"Received request: {json.dumps(body)}")
 
-    # Handle Slack URL verification challenge
     if body.get('type') == 'url_verification':
         print('Received URL verification challenge')
         return {'challenge': body.get('challenge')}, 200
 
-    # Verify request signature (skip for health checks and dev)
-    if body and body.get('type') != 'url_verification' and os.environ.get('VERIFY_SIGNATURE') != 'false':
-        try:
-            if not verify_slack_signature(request):
-                print('Invalid signature')
-                return 'Invalid signature', 401
-        except Exception as e:
-            print(f'Signature verification error: {e}')
-            # Continue anyway in case of verification issues during setup
+    if not verify_slack_signature(request):
+        print('Invalid signature')
+        return 'Invalid signature', 401
 
-    # Process the event
     try:
         event = body.get('event', {})
         channel_mapping = get_channel_mapping()
 
-        # Only process message events (not subtypes like message_changed, etc.)
         if event.get('type') == 'message' and not event.get('subtype'):
             channel_id = event.get('channel')
             mapping = channel_mapping.get(channel_id)
@@ -324,14 +268,12 @@ def slack_webhook(request):
             text = event.get('text', '')
 
             print(f"Processing message from {user_name} in {mapping['customerName']}")
-
             append_message_to_doc(
                 doc_id=mapping['docId'],
                 user_name=user_name,
                 timestamp=timestamp,
-                text=text
+                text=text,
             )
-
             print(f"Successfully appended message to doc {mapping['docId']}")
 
     except Exception as e:
@@ -340,7 +282,6 @@ def slack_webhook(request):
     return 'OK', 200
 
 
-# For local testing
 if __name__ == '__main__':
     from flask import Flask, request
     app = Flask(__name__)
