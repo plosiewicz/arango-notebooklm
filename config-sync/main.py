@@ -8,7 +8,7 @@ Runs hourly. For each row in the customer onboarding Google Sheet:
 """
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests as http_requests
 from googleapiclient.discovery import build
@@ -157,11 +157,11 @@ def determine_gong_backfill_days(row):
     if backlog_date:
         ts = parse_date_to_ts(backlog_date)
         if ts:
-            days = (datetime.utcnow() - datetime.utcfromtimestamp(ts)).days
+            days = (datetime.now(timezone.utc) - datetime.fromtimestamp(ts, tz=timezone.utc)).days
             return max(days, 1)
 
     # Default: days since Jan 1 2024
-    days = (datetime.utcnow() - datetime(2024, 1, 1)).days
+    days = (datetime.now(timezone.utc) - datetime(2024, 1, 1, tzinfo=timezone.utc)).days
     return max(days, 1)
 
 
@@ -226,9 +226,9 @@ def process_slack_tab():
 
         # Determine backfill start
         oldest_ts = determine_slack_backfill_ts(row)
-        print(f"Backfill from timestamp {oldest_ts} ({datetime.utcfromtimestamp(oldest_ts).isoformat()})")
+        print(f"Backfill from timestamp {oldest_ts} ({datetime.fromtimestamp(oldest_ts, tz=timezone.utc).isoformat()})")
 
-        # Trigger backfill
+        resp = None
         try:
             resp = http_requests.get(
                 SLACK_SYNC_URL,
@@ -255,8 +255,9 @@ def process_slack_tab():
                 'error': str(e),
             })
 
-        # Mark Config done = Y in the sheet
-        if config_done_col:
+        # Mark Config done = Y only if backfill succeeded; failed rows
+        # stay blank so the operator can see and remediate.
+        if config_done_col and resp is not None and resp.status_code == 200:
             cell_ref = f'{config_done_col}{row_index}'
             try:
                 write_cell(SLACK_TAB, cell_ref, 'Y')
@@ -329,13 +330,17 @@ def process_gong_tab():
         backfill_days = determine_gong_backfill_days(row)
         print(f"Backfill {backfill_days} days")
 
-        # Trigger backfill
+        resp = None
         try:
+            # account filter scopes gong-sync's per-call work to just this
+            # customer; without it, gong-sync runs dedup against every
+            # mapped doc and config-sync OOMs waiting for the response.
             resp = http_requests.get(
                 GONG_SYNC_URL,
                 params={
                     'backfill': 'true',
                     'days': str(backfill_days),
+                    'account': email_domain,
                 },
                 timeout=540,
             )
@@ -355,8 +360,9 @@ def process_gong_tab():
                 'error': str(e),
             })
 
-        # Mark Config done = Y in the sheet
-        if config_done_col:
+        # Mark Config done = Y only if backfill succeeded; failed rows
+        # stay blank so the operator can see and remediate.
+        if config_done_col and resp is not None and resp.status_code == 200:
             cell_ref = f'{config_done_col}{row_index}'
             try:
                 write_cell(GONG_TAB, cell_ref, 'Y')
@@ -369,13 +375,13 @@ def process_gong_tab():
 
 def config_sync(request):
     """Main Cloud Function entry point. Triggered daily by Cloud Scheduler."""
-    print(f"Config sync started at {datetime.utcnow().isoformat()}")
+    print(f"Config sync started at {datetime.now(timezone.utc).isoformat()}")
 
     slack_results = process_slack_tab()
     gong_results = process_gong_tab()
 
     result = {
-        'timestamp': datetime.utcnow().isoformat(),
+        'timestamp': datetime.now(timezone.utc).isoformat(),
         'slack': {
             'new_channels': len(slack_results),
             'details': slack_results,

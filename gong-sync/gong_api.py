@@ -1,6 +1,6 @@
 """Gong API client for fetching calls, transcripts, and summaries."""
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -44,13 +44,15 @@ def get_calls_since(hours_ago=24):
     Returns list of call objects with basic info.
     """
     # Calculate time range
-    to_time = datetime.utcnow()
+    to_time = datetime.now(timezone.utc)
     from_time = to_time - timedelta(hours=hours_ago)
-    
+
     url = f"{GONG_API_BASE}/calls"
+    # Explicit strftime: tz-aware isoformat() emits "+00:00" which would
+    # collide with a trailing "Z". Gong accepts "...Z" cleanly.
     params = {
-        "fromDateTime": from_time.isoformat() + "Z",
-        "toDateTime": to_time.isoformat() + "Z"
+        "fromDateTime": from_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "toDateTime": to_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     
     response = requests.get(url, headers=get_headers(), params=params)
@@ -81,8 +83,8 @@ def get_calls_in_range(from_date, to_date):
     while True:
         url = f"{GONG_API_BASE}/calls"
         params = {
-            "fromDateTime": from_date.isoformat() + "Z",
-            "toDateTime": to_date.isoformat() + "Z"
+            "fromDateTime": from_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "toDateTime": to_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         if cursor:
             params["cursor"] = cursor

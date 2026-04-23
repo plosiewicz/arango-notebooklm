@@ -24,5 +24,5 @@ gcloud functions deploy config-sync \
     --trigger-http \
     --allow-unauthenticated \
     --timeout=540s \
-    --memory=256MB \
+    --memory=512MB \
     "$@"

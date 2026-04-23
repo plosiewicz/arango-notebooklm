@@ -15,7 +15,7 @@ account and skip any call whose "GONG CALL: <title>" + formatted date
 already appears.
 """
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from gong_api import (
     format_transcript,
@@ -230,14 +230,14 @@ def gong_sync(request):
     backfill_mode = args.get('backfill', 'false').lower() == 'true'
     account_filter = args.get('account', '').strip() or None
 
-    print(f"Starting Gong sync at {datetime.utcnow().isoformat()} (backfill={backfill_mode})")
+    print(f"Starting Gong sync at {datetime.now(timezone.utc).isoformat()} (backfill={backfill_mode})")
     if account_filter:
         print(f"Account filter: {account_filter}")
 
     if backfill_mode:
         days = int(args.get('days', 90))
         print(f"Backfill: fetching calls from the last {days} days")
-        to_date = datetime.utcnow()
+        to_date = datetime.now(timezone.utc)
         from_date = to_date - timedelta(days=days)
         calls = get_calls_in_range(from_date, to_date)
     else:

@@ -22,6 +22,7 @@ shift
 
 deploy_one() {
     local name="$1"
+    shift
     echo "--- Deploying $name ---"
     "$REPO_ROOT/$name-sync/deploy.sh" "$@"
 }
