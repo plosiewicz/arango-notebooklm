@@ -11,10 +11,10 @@ import os
 from datetime import datetime, timezone
 
 import requests as http_requests
-from googleapiclient.discovery import build
 
 from shared.gcs_mapping import load_mapping, save_mapping
 from shared.secrets import get_secret
+from shared.sheets import get_column_letter, read_tab, write_cell
 
 SHEET_ID = '1p8CZ5RBGkFSf6aPnUIz8DXai9_UgNZhj7g1JtbPMvzI'
 SLACK_TAB = 'slack'
@@ -25,59 +25,6 @@ GONG_SYNC_URL = 'https://us-central1-slack-notebooklm-sync.cloudfunctions.net/go
 
 # Jan 1, 2024 00:00:00 UTC as Unix timestamp
 JAN_1_2024_TS = 1704067200
-
-_sheets_client = None
-
-
-def get_sheets_client():
-    global _sheets_client
-    if _sheets_client is None:
-        _sheets_client = build('sheets', 'v4')
-    return _sheets_client
-
-
-def read_sheet_tab(tab_name):
-    """Read all rows from a sheet tab. Returns list of dicts keyed by header."""
-    sheets = get_sheets_client()
-    result = sheets.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID,
-        range=f'{tab_name}!A:Z',
-    ).execute()
-
-    values = result.get('values', [])
-    if len(values) < 2:
-        return []
-
-    headers = values[0]
-    rows = []
-    for i, row in enumerate(values[1:], start=2):  # start=2 for 1-indexed sheet row
-        # Pad row to match header length
-        padded = row + [''] * (len(headers) - len(row))
-        row_dict = {headers[j]: padded[j] for j in range(len(headers))}
-        row_dict['_row_index'] = i  # Track row number for writing back
-        rows.append(row_dict)
-
-    return rows
-
-
-def write_cell(tab_name, cell_ref, value):
-    """Write a value to a specific cell in the sheet."""
-    sheets = get_sheets_client()
-    sheets.spreadsheets().values().update(
-        spreadsheetId=SHEET_ID,
-        range=f'{tab_name}!{cell_ref}',
-        valueInputOption='RAW',
-        body={'values': [[value]]}
-    ).execute()
-
-
-def get_column_letter(headers, column_name):
-    """Get the spreadsheet column letter (A, B, C...) for a given header name."""
-    try:
-        idx = headers.index(column_name)
-        return chr(ord('A') + idx)
-    except ValueError:
-        return None
 
 
 def get_slack_channel_created_ts(channel_id):
@@ -169,7 +116,7 @@ def process_slack_tab():
     """Process the Slack tab: update channel mapping and trigger backfill for new channels."""
     print("Processing Slack tab...")
 
-    rows = read_sheet_tab(SLACK_TAB)
+    rows = read_tab(SHEET_ID, SLACK_TAB)
     if not rows:
         print("No rows in Slack tab")
         return []
@@ -260,7 +207,7 @@ def process_slack_tab():
         if config_done_col and resp is not None and resp.status_code == 200:
             cell_ref = f'{config_done_col}{row_index}'
             try:
-                write_cell(SLACK_TAB, cell_ref, 'Y')
+                write_cell(SHEET_ID, SLACK_TAB, cell_ref, 'Y')
                 print(f"Marked {cell_ref} as Y")
             except Exception as e:
                 print(f"Error marking config done for row {row_index}: {e}")
@@ -272,7 +219,7 @@ def process_gong_tab():
     """Process the Gong tab: update account mapping and trigger backfill for new accounts."""
     print("Processing Gong tab...")
 
-    rows = read_sheet_tab(GONG_TAB)
+    rows = read_tab(SHEET_ID, GONG_TAB)
     if not rows:
         print("No rows in Gong tab")
         return []
@@ -365,7 +312,7 @@ def process_gong_tab():
         if config_done_col and resp is not None and resp.status_code == 200:
             cell_ref = f'{config_done_col}{row_index}'
             try:
-                write_cell(GONG_TAB, cell_ref, 'Y')
+                write_cell(SHEET_ID, GONG_TAB, cell_ref, 'Y')
                 print(f"Marked {cell_ref} as Y")
             except Exception as e:
                 print(f"Error marking config done for row {row_index}: {e}")

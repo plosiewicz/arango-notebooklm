@@ -93,16 +93,19 @@ def _reset_shared_caches():
     """Ensure module-level caches in `shared.*` don't leak state across tests."""
     import shared.gcs_mapping as gcs_mapping
     import shared.secrets as secrets
+    import shared.sheets as sheets
 
     gcs_mapping._cache.clear()
     gcs_mapping._client = None
     secrets._cache.clear()
     secrets._client = None
+    sheets._sheets_client = None
     yield
     gcs_mapping._cache.clear()
     gcs_mapping._client = None
     secrets._cache.clear()
     secrets._client = None
+    sheets._sheets_client = None
 
 
 @pytest.fixture(autouse=True)
@@ -124,6 +127,7 @@ def _no_real_io(monkeypatch):
 
     monkeypatch.setattr("shared.secrets.get_secret", _fail)
     monkeypatch.setattr("shared.gcs_mapping._get_client", _fail)
+    monkeypatch.setattr("shared.sheets.get_sheets_client", _fail)
 
     # Propagate to any service alias modules already loaded.
     for alias in ("slack_main", "gong_main", "gong_api", "config_main"):

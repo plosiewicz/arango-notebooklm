@@ -2,11 +2,13 @@
 
 No real HTTP, no real Google Sheets - we cover:
   * parse_date_to_ts: five accepted formats + unparseable input
-  * get_column_letter: A, B, Z, unknown -> None
   * determine_slack_backfill_ts: explicit date wins; else channel-created
     capped at Jan 1 2024; else Jan 1 2024
   * determine_gong_backfill_days: explicit date wins; else days-since-
     Jan-1-2024; both clamped to >= 1
+
+`get_column_letter` moved to shared/sheets.py and its tests now live in
+test_shared_sheets.py.
 """
 from datetime import datetime, timezone
 
@@ -33,21 +35,6 @@ def test_parse_date_to_ts_returns_none_for_empty_and_unparseable(config_main):
     assert config_main.parse_date_to_ts(None) is None
     assert config_main.parse_date_to_ts("not a date") is None
     assert config_main.parse_date_to_ts("2024-13-45") is None
-
-
-def test_get_column_letter_common_positions(config_main):
-    headers = ["A-col", "B-col", "C-col"]
-    assert config_main.get_column_letter(headers, "A-col") == "A"
-    assert config_main.get_column_letter(headers, "B-col") == "B"
-
-
-def test_get_column_letter_far_column(config_main):
-    headers = [f"col{i}" for i in range(26)]  # A..Z
-    assert config_main.get_column_letter(headers, "col25") == "Z"
-
-
-def test_get_column_letter_missing_header_returns_none(config_main):
-    assert config_main.get_column_letter(["x", "y"], "not there") is None
 
 
 def test_determine_slack_backfill_ts_explicit_date_wins(config_main, monkeypatch):
