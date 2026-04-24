@@ -115,7 +115,7 @@ def test_write_calls_scraped_column_missing_header_logs_and_skips(gong_main, mon
 
     batch_mock.assert_not_called()
     captured = capsys.readouterr()
-    assert "Calls scraped" in captured.out
+    assert "calls-scraped" in captured.out
     assert "skipping write" in captured.out
 
 
@@ -134,13 +134,13 @@ def test_write_calls_scraped_column_multi_doc_writes_absolute_count(gong_main, m
             {
                 "customer-email-domain": "acme.com",
                 "document-id": "doc-A",
-                "Calls scraped": "",
+                "calls-scraped": "",
                 "_row_index": 2,
             },
             {
                 "customer-email-domain": "widgets.io",
                 "document-id": "doc-B",
-                "Calls scraped": "",
+                "calls-scraped": "",
                 "_row_index": 5,
             },
         ],
@@ -157,7 +157,7 @@ def test_write_calls_scraped_column_multi_doc_writes_absolute_count(gong_main, m
     batch_mock.assert_called_once()
     sheet_id, updates = batch_mock.call_args.args
     assert sheet_id == gong_main.SHEET_ID
-    # Calls scraped is the 3rd column (index 2) -> letter C
+    # calls-scraped is the 3rd column (index 2) -> letter C
     assert sorted(updates) == sorted([("gong!C2", 3), ("gong!C5", 1)])
 
 
@@ -172,7 +172,7 @@ def test_write_calls_scraped_column_skips_doc_with_no_mapped_row(gong_main, monk
         lambda sid, tab: [
             {
                 "customer-email-domain": "acme.com",
-                "Calls scraped": "",
+                "calls-scraped": "",
                 "_row_index": 2,
             },
         ],
@@ -199,17 +199,17 @@ def test_write_calls_scraped_column_skips_row_not_in_mapping(gong_main, monkeypa
         lambda sid, tab: [
             {
                 "customer-email-domain": "acme.com",
-                "Calls scraped": "",
+                "calls-scraped": "",
                 "_row_index": 2,
             },
             {
                 "customer-email-domain": "unknown.co",
-                "Calls scraped": "",
+                "calls-scraped": "",
                 "_row_index": 3,
             },
             {
                 "customer-email-domain": "",  # blank key
-                "Calls scraped": "",
+                "calls-scraped": "",
                 "_row_index": 4,
             },
         ],
@@ -232,7 +232,7 @@ def test_write_calls_scraped_column_does_not_count_bare_header_in_transcript(gon
         lambda sid, tab: [
             {
                 "customer-email-domain": "acme.com",
-                "Calls scraped": "",
+                "calls-scraped": "",
                 "_row_index": 2,
             },
         ],

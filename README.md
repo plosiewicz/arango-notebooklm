@@ -143,7 +143,7 @@ Customer onboarding lives in **one** Google Sheet:
 - `slack` tab: Slack Channel ID, Document ID, Customer Name,
   `Config done (Y/N)`, (optional) `Backlog through`
 - `gong` tab: customer-email-domain, document-id, customer-name,
-  `Config done (Y/N)`, (optional) `backlog-through`, `Calls scraped`
+  `Config done (Y/N)`, (optional) `backlog-through`, `calls-scraped`
   (read-only, managed by gong-sync)
 
 Flow (runs hourly from config-sync):
@@ -220,7 +220,7 @@ gcloud functions logs read config-sync --region=us-central1 --project=slack-note
 | gong-sync "skipped_accounts" in logs | Account on the call doesn't match any sheet row | Add the account (email domain, name, or CRM id) to the `gong` tab. |
 | Duplicate Slack messages | Slack retried before the function returned 200 | Verified dedup: function drops `X-Slack-Retry-Num` headers. Check logs. |
 | Sheet row stuck on blank `Config done` after onboarding | Backfill returned non-200, or config-sync was killed before writing the cell. Mapping was saved at the start of the run so config-sync won't auto-retry. | Check `gong-sync` / `slack-sync` logs for that customer, re-run the backfill manually (`?account=` for Gong, `?channel=` for Slack), then mark `Y` by hand. |
-| `Calls scraped` stays blank for an account | Either the column header is missing from the gong tab, or gong-sync hasn't processed a call for that customer yet. | Add the `Calls scraped` column header to the gong tab if it's missing. Otherwise wait - the cell auto-populates on the next gong-sync run that touches the account, or kick a backfill with `?backfill=true&account=<domain>`. |
+| `calls-scraped` stays blank for an account | Either the column header is missing from the gong tab, or gong-sync hasn't processed a call for that customer yet. | Add the `calls-scraped` column header to the gong tab if it's missing. Otherwise wait - the cell auto-populates on the next gong-sync run that touches the account, or kick a backfill with `?backfill=true&account=<domain>`. |
 | NotebookLM source not updating | Doc updated, but NotebookLM cache | Re-index in NotebookLM UI. |
 
 ---

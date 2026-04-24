@@ -2,7 +2,7 @@
 
 The onboarding sheet is the system of record for which slack channel /
 gong account maps to which Google Doc. config-sync reads it on every
-run; gong-sync writes back to it (currently just the 'Calls scraped'
+run; gong-sync writes back to it (currently just the 'calls-scraped'
 column). Centralizing the thin wrapper here avoids two services
 growing their own divergent copies.
 

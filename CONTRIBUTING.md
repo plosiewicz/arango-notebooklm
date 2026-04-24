@@ -163,7 +163,7 @@ config-sync-reads. Exceptions:
 - `Config done (Y/N)` (both tabs) - config-sync writes `Y` after a
   successful one-shot backfill. Humans can pre-populate it to opt a
   row out of backfill (it's treated as already-handled).
-- `Calls scraped` (`gong` tab) - gong-sync writes the absolute number
+- `calls-scraped` (`gong` tab) - gong-sync writes the absolute number
   of `GONG CALL:` header blocks currently in each customer's doc on
   every run that touches that doc. Hand-edits are overwritten on the
   next sync. If the column is missing from the tab, gong-sync logs

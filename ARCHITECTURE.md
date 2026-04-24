@@ -87,7 +87,7 @@ Four tiny helpers every service depends on:
   `batch_update_values(sheet_id, updates)`. Thin wrapper around the
   Sheets v4 Discovery client with a module-level client cache.
   config-sync reads + single-cell writes; gong-sync batch-writes the
-  `Calls scraped` column.
+  `calls-scraped` column.
 
 Because Cloud Functions can't import from a sibling path, each service's
 `deploy.sh` does `rsync -a --delete ../shared/ ./shared/` before running
@@ -149,7 +149,7 @@ Both modes converge on `process_calls`, which:
    appends the whole block (header + AI summary + transcript).
 7. After all appends complete, counts the three-line `GONG CALL:`
    header prefix in each cached doc text and batch-writes the absolute
-   value to the `Calls scraped` column on the gong tab
+   value to the `calls-scraped` column on the gong tab
    (`_write_calls_scraped_column`). Idempotent, concurrency-safe, and
    auto-backfills existing calls on first touch because the count is
    derived from the doc's current text, not a delta. Silent no-op if
@@ -232,11 +232,11 @@ tabs:
 - `slack` - `Slack Channel ID`, `Document ID`, `Customer Name`,
   `Config done (Y/N)`, optional `Backlog through`.
 - `gong` - `customer-email-domain`, `document-id`, `customer-name`,
-  `Config done (Y/N)`, optional `backlog-through`, and `Calls scraped`
+  `Config done (Y/N)`, optional `backlog-through`, and `calls-scraped`
   (managed by gong-sync, do not hand-edit: overwritten on every run
   that touches this customer's doc).
 
-Humans edit the sheet; config-sync does the rest. The `Calls scraped`
+Humans edit the sheet; config-sync does the rest. The `calls-scraped`
 column is the exception - gong-sync batch-writes the absolute
 "GONG CALL:" header count on every run, so the cell is always a
 mirror of the doc's contents. If the header is missing from the tab,

@@ -32,10 +32,10 @@ from shared.sheets import batch_update_values, get_column_letter, read_tab
 MAPPING_BLOB = 'account-mapping.json'
 
 # Onboarding sheet: same sheet config-sync reads to build the
-# account-mapping.json blob. We only write the 'Calls scraped' column.
+# account-mapping.json blob. We only write the 'calls-scraped' column.
 SHEET_ID = '1p8CZ5RBGkFSf6aPnUIz8DXai9_UgNZhj7g1JtbPMvzI'
 GONG_TAB = 'gong'
-CALLS_SCRAPED_COLUMN = 'Calls scraped'
+CALLS_SCRAPED_COLUMN = 'calls-scraped'
 
 # Distinctive three-line prefix that gong-sync itself writes at the top
 # of every call block (see format_call_for_doc). Anchored with the
@@ -120,7 +120,7 @@ def process_calls(calls, account_filter=None):
 
     Returns (processed_count, errors, skipped_accounts, skipped_dupes,
     doc_text_cache). The cache maps doc_id -> final doc text as of
-    end-of-run; the caller uses it to update the 'Calls scraped'
+    end-of-run; the caller uses it to update the 'calls-scraped'
     column without re-reading the docs.
     """
     if not calls:
@@ -276,7 +276,7 @@ def gong_sync(request):
     except Exception as e:
         # Don't fail the sync if the sheet write fails - the next run
         # will recompute the absolute count. Just log and carry on.
-        print(f"Error writing 'Calls scraped' column: {e}")
+        print(f"Error writing 'calls-scraped' column: {e}")
 
     result = {
         "message": f"Processed {processed_count} calls",
@@ -292,7 +292,7 @@ def gong_sync(request):
 
 
 def _write_calls_scraped_column(doc_text_cache):
-    """Set 'Calls scraped' on the gong tab to the number of GONG CALL
+    """Set 'calls-scraped' on the gong tab to the number of GONG CALL
     headers currently in each doc we touched this run.
 
     Idempotent by construction: always writes the absolute count
