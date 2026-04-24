@@ -77,18 +77,38 @@ def get_doc_text(doc_id):
     return ''.join(text_parts)
 
 
-def append_to_doc(doc_id, content):
-    """Append `content` to the end of a Google Doc.
+def append_to_doc(doc_id_or_ids, content, current_text_bytes=None):
+    """Append `content` to the tail Google Doc and return the doc id used.
 
-    Finds the current end-of-body index and issues a single insertText
-    batchUpdate. Callers are responsible for any formatting/newlines.
+    Accepts either a single doc id (legacy callers) or a list of ids
+    (multi-doc cap-hit flow); the append always lands on the LAST id
+    in the list. Returns the doc id that was actually written to so
+    the caller can update its dedup cache.
+
+    `current_text_bytes` is reserved for cap enforcement (commit 7)
+    and ignored in this commit. Once enforced, passing a value at or
+    above DOC_CAP_BYTES will raise `DocFullError` *before* any
+    Google Docs API call so the caller can buffer the content to
+    `shared.pending` instead.
+
+    Callers that pass `current_text_bytes=None` opt out of cap
+    enforcement (e.g. drain workers that have already fetched fresh
+    text and want to append unconditionally).
     """
+    if isinstance(doc_id_or_ids, str):
+        doc_ids = [doc_id_or_ids]
+    else:
+        doc_ids = list(doc_id_or_ids)
+    if not doc_ids:
+        raise ValueError("append_to_doc requires at least one doc id")
+    target_doc_id = doc_ids[-1]
+
     docs = get_docs_client()
-    doc = docs.documents().get(documentId=doc_id).execute()
+    doc = docs.documents().get(documentId=target_doc_id).execute()
     end_index = doc['body']['content'][-1]['endIndex'] - 1
 
     docs.documents().batchUpdate(
-        documentId=doc_id,
+        documentId=target_doc_id,
         body={
             'requests': [
                 {
@@ -101,4 +121,4 @@ def append_to_doc(doc_id, content):
         },
     ).execute()
 
-    return True
+    return target_doc_id
