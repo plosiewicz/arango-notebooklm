@@ -4,8 +4,42 @@ The services only ever need three things from the Docs API: a client,
 the raw text of a doc (for dedup), and an append to the end of a doc.
 Everything service-specific (message / call formatting) stays in the
 caller.
+
+Cap awareness:
+
+The Google Docs API rejects documents larger than 10MB. We use
+`DOC_CAP_BYTES` (6MB plaintext) as a conservative proxy: real doc
+storage size includes formatting/markup overhead, so we leave a
+generous headroom rather than hit the wall mid-batch. When the cap
+is enforced (see commit 7) `append_to_doc` will raise `DocFullError`
+*before* issuing the batchUpdate, and callers buffer the content to
+GCS via `shared.pending`.
 """
 from googleapiclient.discovery import build
+
+# 6 MB plaintext threshold. The hard wall is 10 MB on Google's side
+# but that includes formatting overhead we can't measure cheaply, so
+# we cap on plaintext and leave headroom.
+DOC_CAP_BYTES = 6 * 1024 * 1024
+
+
+class DocFullError(Exception):
+    """Raised by append_to_doc when the target doc is at or above DOC_CAP_BYTES.
+
+    Callers buffer the formatted content to `shared.pending` and emit
+    a `send_doc_full_alert` (at most once per customer per run) so an
+    operator can extend the doc list. The pending buffer drains on
+    the next run that sees an enlarged doc list.
+
+    Attributes:
+      doc_id:        the offending doc id (the LAST id in the doc list)
+      current_bytes: measured plaintext size at decision time
+    """
+    def __init__(self, doc_id, current_bytes):
+        super().__init__(f"Doc {doc_id} at {current_bytes} bytes (>= {DOC_CAP_BYTES})")
+        self.doc_id = doc_id
+        self.current_bytes = current_bytes
+
 
 _docs_client = None
 

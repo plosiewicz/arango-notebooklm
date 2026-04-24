@@ -80,6 +80,20 @@ def get_column_letter(headers, column_name):
         return None
 
 
+def parse_id_list(cell_value):
+    """Split a comma-separated doc-id cell into a list of ids.
+
+    Onboarding cells now hold either a single id (`doc-abc`) or a
+    comma-separated list (`doc-abc,doc-def`) so a customer can grow
+    their doc list when one hits the cap. Whitespace is stripped and
+    empty fragments are dropped, so trailing commas are forgiven.
+    Returns [] for None or all-whitespace input.
+    """
+    if not cell_value:
+        return []
+    return [p.strip() for p in cell_value.split(',') if p.strip()]
+
+
 def batch_update_values(sheet_id, updates):
     """Apply a batch of single-cell updates in one API call.
 

@@ -99,6 +99,28 @@ def test_get_column_letter_missing_header_returns_none():
     assert sheets.get_column_letter(["x", "y"], "not there") is None
 
 
+def test_parse_id_list_single_id():
+    assert sheets.parse_id_list("doc-abc") == ["doc-abc"]
+
+
+def test_parse_id_list_comma_separated_strips_whitespace():
+    assert sheets.parse_id_list("doc-abc,doc-def , doc-ghi") == [
+        "doc-abc", "doc-def", "doc-ghi",
+    ]
+
+
+def test_parse_id_list_handles_empty_and_trailing_commas():
+    assert sheets.parse_id_list("") == []
+    assert sheets.parse_id_list(None) == []
+    assert sheets.parse_id_list("   ") == []
+    assert sheets.parse_id_list("doc-abc,,doc-def,") == ["doc-abc", "doc-def"]
+
+
+def test_parse_id_list_preserves_order():
+    """Order matters: callers append to the LAST id in the list."""
+    assert sheets.parse_id_list("z,a,m") == ["z", "a", "m"]
+
+
 def test_write_cell_issues_values_update_with_raw(monkeypatch):
     client = MagicMock()
     monkeypatch.setattr(sheets, "get_sheets_client", lambda: client)
