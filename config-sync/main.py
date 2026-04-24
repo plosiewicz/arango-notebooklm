@@ -3,8 +3,22 @@
 Runs hourly. For each row in the customer onboarding Google Sheet:
   1. Push channel/account -> doc mappings into the GCS config bucket
      so slack-sync and gong-sync pick them up on their next cache miss.
-  2. For rows not yet flagged done, trigger a backfill on the relevant
-     sync service and mark the row done.
+  2. For rows not yet flagged done, dispatch a full-history backfill
+     to the relevant sync service (fire-and-forget, short timeout) and
+     mark the row done. The sync service runs the backfill in its own
+     540s budget; config-sync does not wait for completion.
+  3. At the end of the run, fire a fire-and-forget request to
+     slack-sync's drain endpoint so any messages that were buffered to
+     GCS during a doc-cap-hit window get appended to the (newly
+     enlarged) doc list.
+
+Backfill scope is decided by the sync services themselves:
+  * slack-sync defaults `oldest` to the channel's `created` timestamp
+  * gong-sync's full_backfill walks the entire Gong retention window
+
+so config-sync no longer needs date-math or per-row "Backlog through"
+columns. The "Backlog through" column on the sheet is now ignored
+(see ARCHITECTURE.md for the migration plan).
 """
 import json
 import os
@@ -13,7 +27,6 @@ from datetime import datetime, timezone
 import requests as http_requests
 
 from shared.gcs_mapping import load_mapping, save_mapping
-from shared.secrets import get_secret
 from shared.sheets import get_column_letter, read_tab, write_cell
 
 SHEET_ID = '1p8CZ5RBGkFSf6aPnUIz8DXai9_UgNZhj7g1JtbPMvzI'
@@ -23,97 +36,35 @@ GONG_TAB = 'gong'
 SLACK_SYNC_URL = 'https://us-central1-slack-notebooklm-sync.cloudfunctions.net/slack-sync'
 GONG_SYNC_URL = 'https://us-central1-slack-notebooklm-sync.cloudfunctions.net/gong-sync'
 
-# Jan 1, 2024 00:00:00 UTC as Unix timestamp
-JAN_1_2024_TS = 1704067200
+# Fire-and-forget timeout. Long enough to confirm the sync service
+# accepted the dispatch (TLS handshake + initial bytes) but short
+# enough that one slow customer can't blow our 540s budget. The sync
+# service keeps running after our connection drops.
+DISPATCH_TIMEOUT_SECONDS = 5
 
 
-def get_slack_channel_created_ts(channel_id):
-    """Return the Slack channel's `created` unix ts via conversations.info, or None."""
-    try:
-        token = get_secret('slack-bot-token')
-    except Exception as e:
-        print(f"Could not fetch slack-bot-token from Secret Manager: {e}")
-        return None
+def _dispatch(url, params, label):
+    """Fire a GET at `url` with `params` and a short timeout.
 
-    try:
-        resp = http_requests.get(
-            'https://slack.com/api/conversations.info',
-            headers={'Authorization': f'Bearer {token}'},
-            params={'channel': channel_id},
-            timeout=10,
-        )
-        data = resp.json()
-        if data.get('ok'):
-            created = data.get('channel', {}).get('created')
-            if created:
-                return int(created)
-    except Exception as e:
-        print(f"Error getting channel info for {channel_id}: {e}")
-
-    return None
-
-
-def parse_date_to_ts(date_str):
-    """Parse a date string (various formats) into a Unix timestamp."""
-    if not date_str or not date_str.strip():
-        return None
-
-    date_str = date_str.strip()
-
-    # Try common date formats
-    for fmt in ('%m/%d/%Y', '%Y-%m-%d', '%m-%d-%Y', '%m/%d/%y', '%Y/%m/%d'):
-        try:
-            dt = datetime.strptime(date_str, fmt)
-            return int(dt.timestamp())
-        except ValueError:
-            continue
-
-    print(f"Could not parse date: {date_str}")
-    return None
-
-
-def determine_slack_backfill_ts(row):
-    """Determine the oldest timestamp for Slack backfill.
-
-    Uses 'Backlog through' column if set, otherwise the earlier of
-    channel creation date or Jan 1 2024.
+    Returns ('dispatched', None) if the request was accepted (any
+    response code, including 200), or ('error', err_str) on connection
+    failure. A `requests.Timeout` is treated as success: the sync
+    service is still running on the other side, we just don't wait.
     """
-    # Check if there's an explicit backfill date
-    backlog_date = row.get('Backlog through', '').strip()
-    if backlog_date:
-        ts = parse_date_to_ts(backlog_date)
-        if ts:
-            return ts
-
-    # Fall back to channel creation date vs Jan 1 2024 (whichever is earlier)
-    channel_id = row.get('Slack Channel ID', '').strip()
-    if channel_id:
-        created_ts = get_slack_channel_created_ts(channel_id)
-        if created_ts:
-            return min(created_ts, JAN_1_2024_TS)
-
-    return JAN_1_2024_TS
-
-
-def determine_gong_backfill_days(row):
-    """Determine the number of days to backfill for Gong.
-
-    Uses 'backlog-through' column if set, otherwise days since Jan 1 2024.
-    """
-    backlog_date = row.get('backlog-through', '').strip()
-    if backlog_date:
-        ts = parse_date_to_ts(backlog_date)
-        if ts:
-            days = (datetime.now(timezone.utc) - datetime.fromtimestamp(ts, tz=timezone.utc)).days
-            return max(days, 1)
-
-    # Default: days since Jan 1 2024
-    days = (datetime.now(timezone.utc) - datetime(2024, 1, 1, tzinfo=timezone.utc)).days
-    return max(days, 1)
+    try:
+        resp = http_requests.get(url, params=params, timeout=DISPATCH_TIMEOUT_SECONDS)
+        print(f"Dispatched {label}: HTTP {resp.status_code}")
+        return ('dispatched', None)
+    except http_requests.Timeout:
+        print(f"Dispatched {label}: timeout (fire-and-forget, sync continues)")
+        return ('dispatched', None)
+    except Exception as e:
+        print(f"Failed to dispatch {label}: {e}")
+        return ('error', str(e))
 
 
 def process_slack_tab():
-    """Process the Slack tab: update channel mapping and trigger backfill for new channels."""
+    """Process the Slack tab: update channel mapping and dispatch backfill for new channels."""
     print("Processing Slack tab...")
 
     rows = read_tab(SHEET_ID, SLACK_TAB)
@@ -121,14 +72,10 @@ def process_slack_tab():
         print("No rows in Slack tab")
         return []
 
-    headers = list(rows[0].keys())
-    # Remove our internal _row_index from headers
-    headers = [h for h in headers if h != '_row_index']
+    headers = [h for h in rows[0].keys() if h != '_row_index']
 
-    # Load current mapping from GCS
     current_mapping = load_mapping('channel-mapping.json')
 
-    # Build new mapping and find new entries
     new_mapping = {}
     new_channels = []
 
@@ -138,29 +85,24 @@ def process_slack_tab():
         customer_name = row.get('Customer Name', '').strip()
         config_done = row.get('Config done (Y/N)', '').strip().upper()
 
-        # Skip rows missing required fields
         if not channel_id or not doc_id:
             continue
 
-        # Add to mapping (both done and new rows)
         if config_done == 'Y' or not config_done:
             new_mapping[channel_id] = {
                 'docId': doc_id,
                 'customerName': customer_name,
             }
 
-        # Track new channels (config not yet done)
         if not config_done and channel_id not in current_mapping:
             new_channels.append(row)
 
-    # Upload updated mapping if it changed
     if new_mapping != current_mapping:
         save_mapping('channel-mapping.json', new_mapping)
         print(f"Updated channel mapping: {len(current_mapping)} -> {len(new_mapping)} channels")
     else:
         print("Channel mapping unchanged")
 
-    # Trigger backfill and mark done for new channels
     results = []
     config_done_col = get_column_letter(headers, 'Config done (Y/N)')
 
@@ -171,40 +113,25 @@ def process_slack_tab():
 
         print(f"New Slack channel: {customer_name} ({channel_id})")
 
-        # Determine backfill start
-        oldest_ts = determine_slack_backfill_ts(row)
-        print(f"Backfill from timestamp {oldest_ts} ({datetime.fromtimestamp(oldest_ts, tz=timezone.utc).isoformat()})")
+        # No `oldest` param: slack-sync defaults to channel.created so
+        # we capture the entire channel history without date-math here.
+        status, err = _dispatch(
+            SLACK_SYNC_URL,
+            {'backfill': 'true', 'channel': channel_id},
+            f"slack backfill {channel_id}",
+        )
+        results.append({
+            'channel': channel_id,
+            'customer': customer_name,
+            'status': status,
+            'error': err,
+        })
 
-        resp = None
-        try:
-            resp = http_requests.get(
-                SLACK_SYNC_URL,
-                params={
-                    'backfill': 'true',
-                    'channel': channel_id,
-                    'oldest': str(oldest_ts),
-                },
-                timeout=540,
-            )
-            print(f"Backfill response for {channel_id}: {resp.status_code} {resp.text[:500]}")
-            results.append({
-                'channel': channel_id,
-                'customer': customer_name,
-                'status': 'ok' if resp.status_code == 200 else 'error',
-                'response': resp.text[:500],
-            })
-        except Exception as e:
-            print(f"Error triggering backfill for {channel_id}: {e}")
-            results.append({
-                'channel': channel_id,
-                'customer': customer_name,
-                'status': 'error',
-                'error': str(e),
-            })
-
-        # Mark Config done = Y only if backfill succeeded; failed rows
-        # stay blank so the operator can see and remediate.
-        if config_done_col and resp is not None and resp.status_code == 200:
+        # Mark done on dispatch (not completion). The sync service is
+        # idempotent (content-based dedup), so a repeated dispatch is
+        # safe. If dispatch itself fails we leave the cell blank for
+        # the operator to remediate.
+        if config_done_col and status == 'dispatched':
             cell_ref = f'{config_done_col}{row_index}'
             try:
                 write_cell(SHEET_ID, SLACK_TAB, cell_ref, 'Y')
@@ -216,7 +143,7 @@ def process_slack_tab():
 
 
 def process_gong_tab():
-    """Process the Gong tab: update account mapping and trigger backfill for new accounts."""
+    """Process the Gong tab: update account mapping and dispatch full backfill for new accounts."""
     print("Processing Gong tab...")
 
     rows = read_tab(SHEET_ID, GONG_TAB)
@@ -224,13 +151,10 @@ def process_gong_tab():
         print("No rows in Gong tab")
         return []
 
-    headers = list(rows[0].keys())
-    headers = [h for h in headers if h != '_row_index']
+    headers = [h for h in rows[0].keys() if h != '_row_index']
 
-    # Load current mapping from GCS
     current_mapping = load_mapping('account-mapping.json')
 
-    # Build new mapping and find new entries
     new_mapping = {}
     new_accounts = []
 
@@ -240,29 +164,24 @@ def process_gong_tab():
         customer_name = row.get('customer-name', '').strip()
         config_done = row.get('Config done (Y/N)', '').strip().upper()
 
-        # Skip rows missing required fields
         if not email_domain or not doc_id:
             continue
 
-        # Add to mapping (both done and new rows)
         if config_done == 'Y' or not config_done:
             new_mapping[email_domain] = {
                 'docId': doc_id,
                 'customerName': customer_name,
             }
 
-        # Track new accounts (config not yet done)
         if not config_done and email_domain not in current_mapping:
             new_accounts.append(row)
 
-    # Upload updated mapping if it changed
     if new_mapping != current_mapping:
         save_mapping('account-mapping.json', new_mapping)
         print(f"Updated account mapping: {len(current_mapping)} -> {len(new_mapping)} accounts")
     else:
         print("Account mapping unchanged")
 
-    # Trigger backfill and mark done for new accounts
     results = []
     config_done_col = get_column_letter(headers, 'Config done (Y/N)')
 
@@ -273,43 +192,19 @@ def process_gong_tab():
 
         print(f"New Gong account: {customer_name} ({email_domain})")
 
-        # Determine backfill days
-        backfill_days = determine_gong_backfill_days(row)
-        print(f"Backfill {backfill_days} days")
+        status, err = _dispatch(
+            GONG_SYNC_URL,
+            {'full_backfill': 'true', 'account': email_domain},
+            f"gong full_backfill {email_domain}",
+        )
+        results.append({
+            'account': email_domain,
+            'customer': customer_name,
+            'status': status,
+            'error': err,
+        })
 
-        resp = None
-        try:
-            # account filter scopes gong-sync's per-call work to just this
-            # customer; without it, gong-sync runs dedup against every
-            # mapped doc and config-sync OOMs waiting for the response.
-            resp = http_requests.get(
-                GONG_SYNC_URL,
-                params={
-                    'backfill': 'true',
-                    'days': str(backfill_days),
-                    'account': email_domain,
-                },
-                timeout=540,
-            )
-            print(f"Backfill response for {email_domain}: {resp.status_code} {resp.text[:500]}")
-            results.append({
-                'account': email_domain,
-                'customer': customer_name,
-                'status': 'ok' if resp.status_code == 200 else 'error',
-                'response': resp.text[:500],
-            })
-        except Exception as e:
-            print(f"Error triggering backfill for {email_domain}: {e}")
-            results.append({
-                'account': email_domain,
-                'customer': customer_name,
-                'status': 'error',
-                'error': str(e),
-            })
-
-        # Mark Config done = Y only if backfill succeeded; failed rows
-        # stay blank so the operator can see and remediate.
-        if config_done_col and resp is not None and resp.status_code == 200:
+        if config_done_col and status == 'dispatched':
             cell_ref = f'{config_done_col}{row_index}'
             try:
                 write_cell(SHEET_ID, GONG_TAB, cell_ref, 'Y')
@@ -320,12 +215,25 @@ def process_gong_tab():
     return results
 
 
+def fire_slack_drain():
+    """Kick slack-sync's drain endpoint at the end of every run.
+
+    Slack-sync buffers messages to GCS when the doc list is at cap.
+    Once an operator extends the doc list (cap-hit runbook), those
+    buffered messages need to be appended to the new tail. The drain
+    endpoint is cheap when there's nothing to drain, so we fire it
+    every run rather than gating on observed cap-hits.
+    """
+    return _dispatch(SLACK_SYNC_URL, {'drain': 'true'}, 'slack drain')
+
+
 def config_sync(request):
-    """Main Cloud Function entry point. Triggered daily by Cloud Scheduler."""
+    """Main Cloud Function entry point. Triggered hourly by Cloud Scheduler."""
     print(f"Config sync started at {datetime.now(timezone.utc).isoformat()}")
 
     slack_results = process_slack_tab()
     gong_results = process_gong_tab()
+    drain_status, _ = fire_slack_drain()
 
     result = {
         'timestamp': datetime.now(timezone.utc).isoformat(),
@@ -337,13 +245,13 @@ def config_sync(request):
             'new_accounts': len(gong_results),
             'details': gong_results,
         },
+        'slack_drain': drain_status,
     }
 
     print(f"Config sync complete: {json.dumps(result)}")
     return result, 200
 
 
-# For local testing
 if __name__ == '__main__':
     from flask import Flask, request
     app = Flask(__name__)

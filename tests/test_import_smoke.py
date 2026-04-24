@@ -36,7 +36,8 @@ def test_config_main_imports(config_main):
     assert callable(config_main.config_sync)
     assert callable(config_main.process_slack_tab)
     assert callable(config_main.process_gong_tab)
-    assert callable(config_main.parse_date_to_ts)
+    assert callable(config_main.fire_slack_drain)
+    assert callable(config_main._dispatch)
 
 
 def test_shared_modules_import():

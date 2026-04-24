@@ -1,90 +1,167 @@
 """Tests for pure helpers in config-sync/main.py.
 
-No real HTTP, no real Google Sheets - we cover:
-  * parse_date_to_ts: five accepted formats + unparseable input
-  * determine_slack_backfill_ts: explicit date wins; else channel-created
-    capped at Jan 1 2024; else Jan 1 2024
-  * determine_gong_backfill_days: explicit date wins; else days-since-
-    Jan-1-2024; both clamped to >= 1
+Covers the new dispatcher onboarding flow:
+  * _dispatch: success, timeout-as-success, connection-error
+  * process_slack_tab: dispatches with no `oldest` param so slack-sync
+    defaults to channel.created; marks Config done = Y on dispatch
+  * process_gong_tab: dispatches `full_backfill=true&account=<domain>`
+    and marks Config done = Y on dispatch
+  * fire_slack_drain: GET ?drain=true at end of every run
+  * config_sync: fires drain after both tabs are processed
 
-`get_column_letter` moved to shared/sheets.py and its tests now live in
+`get_column_letter` lives in shared/sheets.py and is tested in
 test_shared_sheets.py.
 """
-from datetime import datetime, timezone
+from unittest.mock import MagicMock
 
-from freezegun import freeze_time
-
-
-def test_parse_date_to_ts_accepts_each_supported_format(config_main):
-    """All five formats resolve the same calendar date to a deterministic ts."""
-    cases = [
-        "03/25/2024",
-        "2024-03-25",
-        "03-25-2024",
-        "03/25/24",
-        "2024/03/25",
-    ]
-    expected = int(datetime(2024, 3, 25).timestamp())
-    for s in cases:
-        assert config_main.parse_date_to_ts(s) == expected, f"format failed: {s!r}"
+import pytest
 
 
-def test_parse_date_to_ts_returns_none_for_empty_and_unparseable(config_main):
-    assert config_main.parse_date_to_ts("") is None
-    assert config_main.parse_date_to_ts("   ") is None
-    assert config_main.parse_date_to_ts(None) is None
-    assert config_main.parse_date_to_ts("not a date") is None
-    assert config_main.parse_date_to_ts("2024-13-45") is None
+def test_dispatch_returns_dispatched_on_success(config_main, monkeypatch):
+    fake_get = MagicMock(return_value=MagicMock(status_code=200))
+    monkeypatch.setattr(config_main.http_requests, "get", fake_get)
 
+    status, err = config_main._dispatch("http://x", {"k": "v"}, "label")
 
-def test_determine_slack_backfill_ts_explicit_date_wins(config_main, monkeypatch):
-    monkeypatch.setattr(
-        config_main, "get_slack_channel_created_ts",
-        lambda _c: pytest_fail("should not be called"),
+    assert (status, err) == ('dispatched', None)
+    fake_get.assert_called_once_with(
+        "http://x",
+        params={"k": "v"},
+        timeout=config_main.DISPATCH_TIMEOUT_SECONDS,
     )
-    row = {"Backlog through": "06/15/2023", "Slack Channel ID": "C1"}
-    assert config_main.determine_slack_backfill_ts(row) == int(datetime(2023, 6, 15).timestamp())
 
 
-def test_determine_slack_backfill_ts_falls_back_to_channel_created_capped(config_main, monkeypatch):
-    """Channel-created used only if it's earlier than Jan 1 2024; else cap wins."""
-    created_before = int(datetime(2023, 6, 1, tzinfo=timezone.utc).timestamp())
-    monkeypatch.setattr(config_main, "get_slack_channel_created_ts", lambda _c: created_before)
-    row = {"Backlog through": "", "Slack Channel ID": "C1"}
-    assert config_main.determine_slack_backfill_ts(row) == created_before
+def test_dispatch_timeout_is_treated_as_dispatched(config_main, monkeypatch):
+    """Fire-and-forget: a request timeout means the sync service is
+    still running on the other side, we just don't wait. Caller must
+    not treat this as failure."""
+    def boom(*args, **kwargs):
+        raise config_main.http_requests.Timeout("simulated")
+    monkeypatch.setattr(config_main.http_requests, "get", boom)
 
-    created_after = int(datetime(2024, 6, 1, tzinfo=timezone.utc).timestamp())
-    monkeypatch.setattr(config_main, "get_slack_channel_created_ts", lambda _c: created_after)
-    assert config_main.determine_slack_backfill_ts(row) == config_main.JAN_1_2024_TS
-
-
-def test_determine_slack_backfill_ts_default_to_jan_1_2024(config_main, monkeypatch):
-    monkeypatch.setattr(config_main, "get_slack_channel_created_ts", lambda _c: None)
-    row = {"Backlog through": "", "Slack Channel ID": ""}
-    assert config_main.determine_slack_backfill_ts(row) == config_main.JAN_1_2024_TS
+    assert config_main._dispatch("http://x", {}, "label") == ('dispatched', None)
 
 
-@freeze_time("2026-03-25 00:00:00", tz_offset=0)
-def test_determine_gong_backfill_days_explicit_date(config_main):
-    # 10 days before the frozen "now" - tz-aware delta
-    row = {"backlog-through": "03/15/2026"}
-    assert config_main.determine_gong_backfill_days(row) == 10
+def test_dispatch_connection_error_returns_error(config_main, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("cant connect")
+    monkeypatch.setattr(config_main.http_requests, "get", boom)
+
+    status, err = config_main._dispatch("http://x", {}, "label")
+    assert status == 'error'
+    assert "cant connect" in err
 
 
-@freeze_time("2026-03-25 00:00:00", tz_offset=0)
-def test_determine_gong_backfill_days_default_since_jan_1_2024(config_main):
-    row = {"backlog-through": ""}
-    # 2024-01-01 -> 2026-03-25 = 366 (2024) + 365 (2025) + 83 (Jan 31 + Feb 28 + Mar 24) = 814
-    assert config_main.determine_gong_backfill_days(row) == 814
+@pytest.fixture
+def _stubbed_sheet(monkeypatch, config_main):
+    """Stub out the GCS mapping + sheet writes so tests can focus on dispatch."""
+    monkeypatch.setattr(config_main, "load_mapping", lambda blob: {})
+    monkeypatch.setattr(config_main, "save_mapping", lambda blob, m: None)
+    monkeypatch.setattr(config_main, "write_cell", MagicMock())
+    return None
 
 
-@freeze_time("2024-01-02 00:00:00", tz_offset=0)
-def test_determine_gong_backfill_days_clamps_to_one(config_main):
-    """A backlog date in the future or equal to today must not return 0 or negative."""
-    row = {"backlog-through": "01/02/2024"}
-    assert config_main.determine_gong_backfill_days(row) == 1
+def test_process_slack_tab_dispatches_without_oldest_param(config_main, monkeypatch, _stubbed_sheet):
+    """The new contract: omit `oldest` so slack-sync defaults to channel.created."""
+    monkeypatch.setattr(
+        config_main, "read_tab",
+        lambda sid, tab: [
+            {
+                "Slack Channel ID": "C1",
+                "Document ID": "doc-1",
+                "Customer Name": "Acme",
+                "Config done (Y/N)": "",
+                "_row_index": 2,
+            },
+        ],
+    )
+    fake_get = MagicMock(return_value=MagicMock(status_code=200))
+    monkeypatch.setattr(config_main.http_requests, "get", fake_get)
+
+    results = config_main.process_slack_tab()
+
+    fake_get.assert_called_once_with(
+        config_main.SLACK_SYNC_URL,
+        params={"backfill": "true", "channel": "C1"},
+        timeout=config_main.DISPATCH_TIMEOUT_SECONDS,
+    )
+    assert results == [{
+        "channel": "C1",
+        "customer": "Acme",
+        "status": "dispatched",
+        "error": None,
+    }]
+    config_main.write_cell.assert_called_once()
+    args = config_main.write_cell.call_args.args
+    assert args[0] == config_main.SHEET_ID
+    assert args[1] == config_main.SLACK_TAB
+    assert args[3] == 'Y'
 
 
-def pytest_fail(msg):
-    """Module-level helper: raising inside a lambda keeps the test readable."""
-    raise AssertionError(msg)
+def test_process_gong_tab_dispatches_full_backfill(config_main, monkeypatch, _stubbed_sheet):
+    """Gong onboarding now triggers full_backfill so the sync runs the
+    entire Gong retention window on the gong-sync side, not here."""
+    monkeypatch.setattr(
+        config_main, "read_tab",
+        lambda sid, tab: [
+            {
+                "customer-email-domain": "acme.com",
+                "document-id": "doc-A",
+                "customer-name": "Acme",
+                "Config done (Y/N)": "",
+                "_row_index": 2,
+            },
+        ],
+    )
+    fake_get = MagicMock(return_value=MagicMock(status_code=200))
+    monkeypatch.setattr(config_main.http_requests, "get", fake_get)
+
+    results = config_main.process_gong_tab()
+
+    fake_get.assert_called_once_with(
+        config_main.GONG_SYNC_URL,
+        params={"full_backfill": "true", "account": "acme.com"},
+        timeout=config_main.DISPATCH_TIMEOUT_SECONDS,
+    )
+    assert results[0]["status"] == "dispatched"
+    config_main.write_cell.assert_called_once()
+
+
+def test_dispatch_does_not_mark_done_on_error(config_main, monkeypatch, _stubbed_sheet):
+    monkeypatch.setattr(
+        config_main, "read_tab",
+        lambda sid, tab: [
+            {
+                "Slack Channel ID": "C1",
+                "Document ID": "doc-1",
+                "Customer Name": "Acme",
+                "Config done (Y/N)": "",
+                "_row_index": 2,
+            },
+        ],
+    )
+    def boom(*a, **kw):
+        raise RuntimeError("dns fail")
+    monkeypatch.setattr(config_main.http_requests, "get", boom)
+
+    results = config_main.process_slack_tab()
+
+    assert results[0]["status"] == "error"
+    config_main.write_cell.assert_not_called()
+
+
+def test_config_sync_fires_slack_drain_at_end(config_main, monkeypatch):
+    monkeypatch.setattr(config_main, "process_slack_tab", lambda: [])
+    monkeypatch.setattr(config_main, "process_gong_tab", lambda: [])
+    fake_get = MagicMock(return_value=MagicMock(status_code=200))
+    monkeypatch.setattr(config_main.http_requests, "get", fake_get)
+
+    body, status = config_main.config_sync(MagicMock())
+
+    assert status == 200
+    assert body["slack_drain"] == "dispatched"
+    fake_get.assert_called_once_with(
+        config_main.SLACK_SYNC_URL,
+        params={"drain": "true"},
+        timeout=config_main.DISPATCH_TIMEOUT_SECONDS,
+    )
