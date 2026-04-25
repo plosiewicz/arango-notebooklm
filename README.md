@@ -10,12 +10,16 @@ Three Cloud Functions, all in GCP project `slack-notebooklm-sync`
 
 | Service | Trigger | What it does |
 |---|---|---|
-| `slack-sync` | Slack webhook + ad-hoc `?backfill=true` | Appends new Slack messages to the mapped Google Doc; also handles historical backfills. |
-| `gong-sync` | Cloud Scheduler (hourly) + ad-hoc | Pulls recent Gong calls, dedups against each customer doc, appends transcript + summary. |
-| `config-sync` | Cloud Scheduler (hourly) | Reads the customer-onboarding Google Sheet, updates the GCS mapping blobs, triggers a backfill for any brand-new rows. |
+| `slack-sync` | Slack webhook + `?backfill=true` + `?drain=true` + `?full_backfill_all=true` | Appends new Slack messages to the mapped doc list; backfills history from `channel.created`; drains GCS-buffered messages once a capped doc is extended. |
+| `gong-sync` | Cloud Scheduler (hourly) + `?full_backfill=true&account=...` + `?full_backfill_all=true` | Drains pending calls, pulls recent Gong calls, dedups against the customer's full doc list, appends to the tail doc; writes `first-call-recorded` / `last-call-recorded` columns. |
+| `config-sync` | Cloud Scheduler (hourly) | Reads the customer-onboarding Google Sheet, updates the GCS mapping blobs, dispatches backfills (5s timeout, fire-and-forget) for new rows, fires `slack-sync?drain=true` at end of run. |
+
+All three services share a small `shared/` library and rsync it into
+each service directory at deploy time.
 
 See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full picture of how
-data flows between them.
+data flows between them, including the cap-hit runbook and the
+existing-customer sweep.
 
 ---
 
@@ -32,32 +36,26 @@ data flows between them.
 ├── pyproject.toml             ruff config (F ruleset)
 ├── .github/workflows/ci.yml   ruff + pytest + shellcheck on push/PR
 ├── shared/                    imported by every service
-│   ├── google_docs.py         get_docs_client, get_doc_text, append_to_doc
+│   ├── google_docs.py         get_doc_text, append_to_doc, DocFullError, DOC_CAP_BYTES
 │   ├── gcs_mapping.py         load_mapping, save_mapping (5 min cache)
 │   ├── secrets.py             get_secret (Secret Manager wrapper)
-│   └── sheets.py              read_tab, write_cell, get_column_letter, batch_update_values
+│   ├── sheets.py              read_tab, write_cell, get_column_letter, batch_update_values, parse_id_list
+│   ├── pending.py             GCS-backed FIFO buffer for cap-hit calls/messages
+│   └── alerts.py              SendGrid wrapper for doc-full operator alerts
 ├── tests/                     pytest suite (Tier 0 + Tier 1)
-│   ├── conftest.py            per-service loaders + autouse no-real-IO
-│   ├── test_import_smoke.py
-│   ├── test_shared_gcs_mapping.py
-│   ├── test_shared_sheets.py
-│   ├── test_config_sync_helpers.py
-│   ├── test_slack_sync_helpers.py
-│   ├── test_gong_sync_helpers.py
-│   └── test_gong_api_helpers.py
 ├── slack-sync/
-│   ├── main.py                webhook + backfill handler
+│   ├── main.py                webhook + backfill + drain + sweep
 │   ├── requirements.txt
 │   ├── .gcloudignore
 │   └── deploy.sh
 ├── gong-sync/
-│   ├── main.py                call processing + dedup
+│   ├── main.py                drain + call processing + date-range writeback
 │   ├── gong_api.py            Gong API client
 │   ├── requirements.txt
 │   ├── .gcloudignore
 │   └── deploy.sh
 └── config-sync/
-    ├── main.py                sheet -> GCS + backfill orchestration
+    ├── main.py                sheet -> GCS + dispatch backfills + fire drain
     ├── requirements.txt
     ├── .gcloudignore
     └── deploy.sh
@@ -109,6 +107,17 @@ All three:
 Any trailing args pass through to `gcloud functions deploy`, so you
 can e.g. `./deploy.sh slack --update-env-vars=FOO=bar`.
 
+First time deploying this version, set `ALERT_EMAIL` and
+`SENDGRID_FROM` on the two sync services so the doc-full alerts can
+fire:
+
+```bash
+gcloud functions deploy gong-sync \
+  --update-env-vars=ALERT_EMAIL=ops@yourcompany.com,SENDGRID_FROM=noreply@yourcompany.com
+gcloud functions deploy slack-sync \
+  --update-env-vars=ALERT_EMAIL=ops@yourcompany.com,SENDGRID_FROM=noreply@yourcompany.com
+```
+
 ---
 
 ## Secrets (GCP Secret Manager)
@@ -119,8 +128,9 @@ All three services pull credentials from Secret Manager via
 | Secret | Used by | Format |
 |---|---|---|
 | `gong-api-key` | gong-sync | `accessKeyId:accessKeySecret` |
-| `slack-bot-token` | slack-sync, config-sync | `xoxb-...` |
+| `slack-bot-token` | slack-sync | `xoxb-...` |
 | `slack-signing-secret` | slack-sync | hex string |
+| `sendgrid-api-key` | gong-sync, slack-sync (via `shared.alerts`) | SendGrid API key |
 
 View / rotate a secret:
 
@@ -140,11 +150,21 @@ A new version is picked up on the next cold start.
 Customer onboarding lives in **one** Google Sheet:
 [NotebookLM customer config](https://docs.google.com/spreadsheets/d/1p8CZ5RBGkFSf6aPnUIz8DXai9_UgNZhj7g1JtbPMvzI).
 
-- `slack` tab: Slack Channel ID, Document ID, Customer Name,
-  `Config done (Y/N)`, (optional) `Backlog through`
-- `gong` tab: customer-email-domain, document-id, customer-name,
-  `Config done (Y/N)`, (optional) `backlog-through`, `calls-scraped`
-  (read-only, managed by gong-sync)
+- `slack` tab: `Slack Channel ID`, `Document ID`, `Customer Name`,
+  `Config done (Y/N)`.
+- `gong` tab: `customer-email-domain`, `document-id`, `customer-name`,
+  `Config done (Y/N)`, `first-call-recorded`, `last-call-recorded`
+  (read-only, managed by gong-sync).
+
+`Document ID` / `document-id` cells hold a single id (`doc-abc`) or a
+comma-separated list (`doc-abc,doc-def`) once a doc hits the size cap.
+New content always lands on the LAST id; dedup runs against the
+concatenation of all ids.
+
+There is no `Backlog through` column anymore. slack-sync defaults
+`oldest` to `channel.created` and gong-sync's `?full_backfill` walks
+the entire 5-year window, so onboarding always captures the full
+history without operator math.
 
 Flow (runs hourly from config-sync):
 
@@ -153,12 +173,13 @@ Flow (runs hourly from config-sync):
    `slack-notebooklm-config` GCS bucket
    (`channel-mapping.json`, `account-mapping.json`).
 3. For each row where `Config done (Y/N)` is blank and the key isn't
-   already in the GCS mapping, config-sync triggers a one-shot
-   backfill on slack-sync (from `Backlog through` or channel creation)
-   or gong-sync (last N days since `backlog-through`, scoped to the
-   row's email domain via `?account=`). Writes `Y` back into the
-   sheet only if the backfill returned HTTP 200; failed rows stay
-   blank for manual remediation (see Troubleshooting).
+   already in the GCS mapping, config-sync **dispatches** a backfill
+   with a 5-second timeout (fire-and-forget). The receiving function
+   runs the backfill in its own 540s budget.
+4. Marks `Config done = Y` on dispatch (not completion). Sync services
+   are content-dedup idempotent so a repeated dispatch is safe.
+5. At the end of every run, fires `slack-sync?drain=true` to flush
+   any messages that were buffered to GCS during a doc-cap-hit window.
 
 slack-sync / gong-sync read the GCS mapping on every request with a
 5-minute in-memory cache.
@@ -174,24 +195,49 @@ slack-sync / gong-sync read the GCS mapping on every request with a
    ```bash
    curl "https://us-central1-slack-notebooklm-sync.cloudfunctions.net/config-sync"
    ```
-5. config-sync flips `Config done` to `Y` once the backfill returns
-   HTTP 200. If the cell stays blank after the next hourly run, the
-   backfill failed - see Troubleshooting.
+5. config-sync flips `Config done` to `Y` once dispatch returns. The
+   actual backfill runs in its own slack-sync / gong-sync invocation.
 6. Add the Google Doc as a source in the customer's NotebookLM.
+
+### When a doc hits the cap
+
+A SendGrid email lands in `ALERT_EMAIL` saying
+`[notebooklm] <service> doc full for <Customer>`. Calls/messages keep
+landing safely in GCS (`pending-calls/<domain>/`,
+`pending-messages/<channel_id>/`). To resume:
+
+1. Create a new Google Doc, share with the service account.
+2. Edit the customer's row: `document-id` becomes `doc-old,doc-new`.
+3. Wait up to an hour, or:
+   ```bash
+   curl ".../slack-sync?drain=true"
+   curl ".../gong-sync?hours=2"     # gong drains at the start of every run
+   ```
+
+Full runbook in [ARCHITECTURE.md](./ARCHITECTURE.md#cap-hit-runbook).
 
 ---
 
 ## Manual triggers & backfills
 
 ```bash
-# slack-sync backfill for one channel (default oldest = Jan 1 2024)
+# slack-sync backfill for one channel (default oldest = channel.created)
 curl "https://us-central1-slack-notebooklm-sync.cloudfunctions.net/slack-sync?backfill=true&channel=C0ABC123XYZ"
+
+# slack-sync drain (flush GCS-buffered messages)
+curl "https://us-central1-slack-notebooklm-sync.cloudfunctions.net/slack-sync?drain=true"
+
+# slack-sync sweep all channels (dispatcher, returns immediately)
+curl "https://us-central1-slack-notebooklm-sync.cloudfunctions.net/slack-sync?full_backfill_all=true"
 
 # gong-sync, last 2 hours (same as scheduler)
 curl "https://us-central1-slack-notebooklm-sync.cloudfunctions.net/gong-sync?hours=2"
 
-# gong-sync backfill, last 90 days, one account only
-curl "https://us-central1-slack-notebooklm-sync.cloudfunctions.net/gong-sync?backfill=true&days=90&account=cadence.com"
+# gong-sync full backfill (5 years), one account only
+curl "https://us-central1-slack-notebooklm-sync.cloudfunctions.net/gong-sync?full_backfill=true&account=cadence.com"
+
+# gong-sync sweep all accounts (dispatcher, returns immediately)
+curl "https://us-central1-slack-notebooklm-sync.cloudfunctions.net/gong-sync?full_backfill_all=true"
 
 # config-sync once
 curl "https://us-central1-slack-notebooklm-sync.cloudfunctions.net/config-sync"
@@ -218,9 +264,11 @@ gcloud functions logs read config-sync --region=us-central1 --project=slack-note
 | `Invalid signature` on slack-sync | `slack-signing-secret` doesn't match the Slack app | Copy from Slack app "Basic Information", add a new version to `slack-signing-secret`. |
 | `Failed to get credentials from Secret Manager` | Service account lacks Secret Accessor, or the secret name doesn't exist | Grant role or create/rename the secret. |
 | gong-sync "skipped_accounts" in logs | Account on the call doesn't match any sheet row | Add the account (email domain, name, or CRM id) to the `gong` tab. |
-| Duplicate Slack messages | Slack retried before the function returned 200 | Verified dedup: function drops `X-Slack-Retry-Num` headers. Check logs. |
-| Sheet row stuck on blank `Config done` after onboarding | Backfill returned non-200, or config-sync was killed before writing the cell. Mapping was saved at the start of the run so config-sync won't auto-retry. | Check `gong-sync` / `slack-sync` logs for that customer, re-run the backfill manually (`?account=` for Gong, `?channel=` for Slack), then mark `Y` by hand. |
-| `calls-scraped` stays blank for an account | Either the column header is missing from the gong tab, or gong-sync hasn't processed a call for that customer yet. | Add the `calls-scraped` column header to the gong tab if it's missing. Otherwise wait - the cell auto-populates on the next gong-sync run that touches the account, or kick a backfill with `?backfill=true&account=<domain>`. |
+| Duplicate Slack messages | Slack retried before the function returned 200 | Function drops `X-Slack-Retry-Num` headers. Check logs. |
+| Sheet row stuck on blank `Config done` | DNS / IAM error during the dispatch (5xx from the sync service is treated as success). | Check `gcloud functions logs read config-sync` for `Failed to dispatch ...`; re-trigger config-sync once the underlying issue is fixed. |
+| `[notebooklm] doc full` email | Customer's tail doc hit 6 MB. Buffered items are safe in GCS. | See [Cap-hit runbook](./ARCHITECTURE.md#cap-hit-runbook). |
+| `first-call-recorded` / `last-call-recorded` blank | Columns missing from the gong tab, or doc has no parseable `GONG CALL:` blocks yet, or the customer was dormant on the last run. | Add column headers; confirm doc has at least one call; kick `?full_backfill=true&account=<domain>`. |
+| Pending-* objects piling up in GCS | Operator hasn't extended the customer's doc list, or the new doc isn't shared with the SA. | `gsutil ls gs://slack-notebooklm-config/pending-calls/` and `pending-messages/`; resolve per the cap-hit runbook. |
 | NotebookLM source not updating | Doc updated, but NotebookLM cache | Re-index in NotebookLM UI. |
 
 ---
@@ -234,6 +282,7 @@ gcloud functions logs read config-sync --region=us-central1 --project=slack-note
 | Runtime service account | `399790122111-compute@developer.gserviceaccount.com` |
 | Config GCS bucket | `slack-notebooklm-config` |
 | Onboarding sheet | `1p8CZ5RBGkFSf6aPnUIz8DXai9_UgNZhj7g1JtbPMvzI` |
+| Doc cap (plaintext) | 6 MB (Google's hard wall is 10 MB) |
 | slack-sync URL | `https://us-central1-slack-notebooklm-sync.cloudfunctions.net/slack-sync` |
 | gong-sync URL | `https://us-central1-slack-notebooklm-sync.cloudfunctions.net/gong-sync` |
 | config-sync URL | `https://us-central1-slack-notebooklm-sync.cloudfunctions.net/config-sync` |
