@@ -128,6 +128,8 @@ def _no_real_io(monkeypatch):
     monkeypatch.setattr("shared.secrets.get_secret", _fail)
     monkeypatch.setattr("shared.gcs_mapping._get_client", _fail)
     monkeypatch.setattr("shared.sheets.get_sheets_client", _fail)
+    monkeypatch.setattr("shared.google_docs.get_docs_client", _fail)
+    monkeypatch.setattr("shared.pending._get_client", _fail)
 
     # Propagate to any service alias modules already loaded.
     for alias in ("slack_main", "gong_main", "gong_api", "config_main"):
