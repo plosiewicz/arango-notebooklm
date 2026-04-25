@@ -76,13 +76,43 @@ def test_append_to_doc_empty_list_raises(monkeypatch):
         gdocs.append_to_doc([], "hello")
 
 
-def test_append_to_doc_ignores_current_text_bytes_for_now(monkeypatch):
-    """current_text_bytes is reserved for commit 7. Today it's accepted
-    and ignored so callers can pass it without breaking; the cap-hit
-    behaviour ships separately."""
+def test_append_to_doc_raises_doc_full_when_projected_exceeds_cap(monkeypatch):
+    """current_bytes + len(content) > cap -> DocFullError BEFORE any API call.
+
+    Pass `current_text_bytes` exactly at the cap and a one-byte append
+    must refuse: we want headroom, not strict equality.
+    """
     client = _fake_docs_client()
     monkeypatch.setattr(gdocs, "get_docs_client", lambda: client)
 
-    out = gdocs.append_to_doc("doc-A", "hello", current_text_bytes=99_999_999)
+    with pytest.raises(gdocs.DocFullError) as exc_info:
+        gdocs.append_to_doc("doc-A", "x", current_text_bytes=gdocs.DOC_CAP_BYTES)
+
+    assert exc_info.value.doc_id == "doc-A"
+    assert exc_info.value.current_bytes == gdocs.DOC_CAP_BYTES
+    client.documents.return_value.get.assert_not_called()
+    client.documents.return_value.batchUpdate.assert_not_called()
+
+
+def test_append_to_doc_allows_append_when_under_cap(monkeypatch):
+    """A 5.99 MB append on a 0-byte doc must succeed - the test is
+    'projected total > cap', not 'content alone > cap'."""
+    client = _fake_docs_client()
+    monkeypatch.setattr(gdocs, "get_docs_client", lambda: client)
+
+    big_content = "x" * (gdocs.DOC_CAP_BYTES - 1)
+    out = gdocs.append_to_doc("doc-A", big_content, current_text_bytes=0)
+
+    assert out == "doc-A"
+    client.documents.return_value.batchUpdate.assert_called_once()
+
+
+def test_append_to_doc_no_cap_check_when_current_bytes_none(monkeypatch):
+    """current_text_bytes=None -> cap is not enforced; any append goes
+    through. Used by one-shot scripts that don't have a cached count."""
+    client = _fake_docs_client()
+    monkeypatch.setattr(gdocs, "get_docs_client", lambda: client)
+
+    out = gdocs.append_to_doc("doc-A", "hello", current_text_bytes=None)
     assert out == "doc-A"
     client.documents.return_value.batchUpdate.assert_called_once()

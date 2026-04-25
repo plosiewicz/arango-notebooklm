@@ -85,15 +85,17 @@ def append_to_doc(doc_id_or_ids, content, current_text_bytes=None):
     in the list. Returns the doc id that was actually written to so
     the caller can update its dedup cache.
 
-    `current_text_bytes` is reserved for cap enforcement (commit 7)
-    and ignored in this commit. Once enforced, passing a value at or
-    above DOC_CAP_BYTES will raise `DocFullError` *before* any
+    `current_text_bytes` is the caller's measured plaintext byte count
+    of the target doc list (the same concatenation it dedups against).
+    When provided AND the resulting doc would push past
+    `DOC_CAP_BYTES`, this function raises `DocFullError` BEFORE any
     Google Docs API call so the caller can buffer the content to
-    `shared.pending` instead.
+    `shared.pending` instead. Callers that pass `current_text_bytes=None`
+    opt out of cap enforcement (e.g. one-shot scripts that want to
+    append unconditionally).
 
-    Callers that pass `current_text_bytes=None` opt out of cap
-    enforcement (e.g. drain workers that have already fetched fresh
-    text and want to append unconditionally).
+    Cap test is `current_text_bytes + len(content.encode('utf-8')) > cap`
+    so we don't refuse a 5.99 MB append on a 0-byte doc.
     """
     if isinstance(doc_id_or_ids, str):
         doc_ids = [doc_id_or_ids]
@@ -102,6 +104,11 @@ def append_to_doc(doc_id_or_ids, content, current_text_bytes=None):
     if not doc_ids:
         raise ValueError("append_to_doc requires at least one doc id")
     target_doc_id = doc_ids[-1]
+
+    if current_text_bytes is not None:
+        projected = current_text_bytes + len(content.encode('utf-8'))
+        if projected > DOC_CAP_BYTES:
+            raise DocFullError(target_doc_id, current_text_bytes)
 
     docs = get_docs_client()
     doc = docs.documents().get(documentId=target_doc_id).execute()
