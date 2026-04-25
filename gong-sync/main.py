@@ -10,11 +10,29 @@ supports ad-hoc backfill via query params:
                              name, or id) - useful for debugging
 
 Account -> doc routing comes from the GCS mapping blob (config-sync is
-the writer). Dedup is content-based: we read the target doc once per
-account and skip any call whose "GONG CALL: <title>" + formatted date
-already appears.
+the writer). The mapping value's `docId` field is parsed via
+`shared.sheets.parse_id_list` so an operator can grow a customer's
+list when a doc hits the cap, e.g. `doc-old,doc-new`. New content
+always lands on the LAST id in that list.
+
+Dedup is content-based and operates over the concatenated text of all
+docs in the customer's list (not just the tail) so a call already
+appended to `doc-old` is never re-appended to `doc-new`.
+
+Cap-hit flow:
+
+  * Each `append_to_doc` call passes the customer's current plaintext
+    byte count (cached from the dedup read) so commit 7's cap check
+    can refuse the append before any API call.
+  * When refused, we serialize the formatted call block to GCS via
+    `shared.pending` (partition = email domain) and emit one
+    `send_doc_full_alert` per customer per run via `shared.alerts`.
+  * The next run starts by draining `pending-calls/<domain>/` for
+    every partition, appending each buffered block to whatever doc
+    list the operator has by then extended.
 """
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 from gong_api import (
@@ -25,23 +43,34 @@ from gong_api import (
     get_calls_since,
     get_transcript,
 )
+
+from shared import alerts, pending
 from shared.gcs_mapping import load_mapping
-from shared.google_docs import append_to_doc, get_doc_text
-from shared.sheets import batch_update_values, get_column_letter, read_tab
+from shared.google_docs import DocFullError, append_to_doc, get_doc_text
+from shared.sheets import (
+    batch_update_values,
+    get_column_letter,
+    parse_id_list,
+    read_tab,
+)
 
 MAPPING_BLOB = 'account-mapping.json'
 
 # Onboarding sheet: same sheet config-sync reads to build the
-# account-mapping.json blob. We only write the 'calls-scraped' column.
+# account-mapping.json blob. We write the first/last-call-recorded
+# columns at the end of every sync.
 SHEET_ID = '1p8CZ5RBGkFSf6aPnUIz8DXai9_UgNZhj7g1JtbPMvzI'
 GONG_TAB = 'gong'
-CALLS_SCRAPED_COLUMN = 'calls-scraped'
+FIRST_CALL_COLUMN = 'first-call-recorded'
+LAST_CALL_COLUMN = 'last-call-recorded'
 
-# Distinctive three-line prefix that gong-sync itself writes at the top
-# of every call block (see format_call_for_doc). Anchored with the
-# preceding newline + separator so a bare "GONG CALL: ..." line inside
-# a transcript can't inflate the count.
-HEADER_PREFIX = "\n=====================================\nGONG CALL: "
+# Anchored "GONG CALL" header followed by a Date: line. format_call_for_doc
+# is the only writer of this exact three-line block; transcripts that
+# happen to mention "GONG CALL: ..." don't carry the surrounding `=====`
+# separator so they can't satisfy the regex.
+_DATE_RE = re.compile(
+    r"\n=+\nGONG CALL:[^\n]*\n=+\nDate: ([^\n]+)",
+)
 
 
 def get_account_mapping():
@@ -49,27 +78,34 @@ def get_account_mapping():
 
 
 def find_mapping_for_account(account_id, account_name):
-    """Return the mapping for an account, matching id first then name (case-insensitive)."""
+    """Return (domain_key, mapping_value) for an account, or (None, None) if unmapped.
+
+    Matches account_id first, then exact account_name, then case-
+    insensitive account_name. Returning the matched key (which is the
+    customer email-domain in the production mapping) lets the caller
+    use it as the GCS pending-queue partition without re-querying.
+    """
     account_mapping = get_account_mapping()
 
     if account_id and account_id in account_mapping:
-        return account_mapping[account_id]
+        return account_id, account_mapping[account_id]
     if account_name and account_name in account_mapping:
-        return account_mapping[account_name]
+        return account_name, account_mapping[account_name]
     if account_name:
         account_lower = account_name.lower()
         for key, value in account_mapping.items():
             if key.lower() == account_lower:
-                return value
-    return None
+                return key, value
+    return None, None
 
 
 def format_call_for_doc(call_details, transcript, summary):
     """Render a Gong call into the doc-ready text block we append.
 
-    The "GONG CALL: <title>" header + formatted date is what our
-    content-based dedup keys off of, so don't change that format without
-    also updating the dedup logic in process_calls.
+    The "GONG CALL: <title>" header + formatted "Date:" line is what
+    our content-based dedup AND the first/last-call-recorded date
+    extraction key off of, so don't change the format without updating
+    both `process_calls` (dedup) and `_DATE_RE` (extraction).
     """
     title = call_details.get("title", "Untitled Call")
     date = call_details.get("started", "Unknown date")
@@ -111,20 +147,125 @@ Participants: {participants_str}
 """
 
 
-def process_calls(calls, account_filter=None):
-    """Fetch details + transcripts for `calls` and append each to its doc.
+def _seed_customer_cache(domain_key, doc_ids, customer_text_cache):
+    """Populate `customer_text_cache[domain_key]` with concatenated text from all docs.
 
-    Dedup is content-based (reads the doc once, caches the text, checks
-    for the call's header line). `account_filter` restricts processing
-    to a single account - non-matching calls are silently skipped.
-
-    Returns (processed_count, errors, skipped_accounts, skipped_dupes,
-    doc_text_cache). The cache maps doc_id -> final doc text as of
-    end-of-run; the caller uses it to update the 'calls-scraped'
-    column without re-reading the docs.
+    No-op if the cache already has an entry for the customer (drain
+    populated it). On read failure we cache an empty string and log;
+    this matches the historical "best-effort dedup" behaviour - we'd
+    rather double-append a call once than skip everything because one
+    doc was unreadable.
     """
+    if domain_key in customer_text_cache:
+        return
+    parts = []
+    for doc_id in doc_ids:
+        try:
+            parts.append(get_doc_text(doc_id))
+        except Exception as e:
+            print(f"Could not read doc {doc_id} for dedup, proceeding without: {e}")
+            parts.append("")
+    customer_text_cache[domain_key] = "".join(parts)
+
+
+def _drain_pending(customer_text_cache, alerted_customers):
+    """Drain `pending-calls/<domain>/` for every partition before normal sync.
+
+    For each pending block we read fresh doc text once (seeding the
+    customer_text_cache so process_calls reuses it), then attempt the
+    append. On DocFullError we alert once and stop draining for that
+    customer - subsequent items would just hit the same wall.
+
+    Returns the number of items successfully drained.
+    """
+    drained = 0
+    try:
+        partitions = pending.list_partitions(pending.PREFIX_GONG)
+    except Exception as e:
+        print(f"Could not list pending-calls partitions: {e}")
+        return drained
+
+    if not partitions:
+        return drained
+
+    print(f"Draining pending calls for {len(partitions)} partition(s)")
+    mapping = get_account_mapping()
+
+    for domain_key in sorted(partitions):
+        entry = mapping.get(domain_key)
+        if not entry:
+            print(f"Pending partition '{domain_key}' has no current mapping, skipping drain")
+            continue
+        doc_ids = parse_id_list(entry.get('docId', ''))
+        if not doc_ids:
+            print(f"Pending partition '{domain_key}' has empty docId, skipping drain")
+            continue
+
+        _seed_customer_cache(domain_key, doc_ids, customer_text_cache)
+
+        for key, payload in pending.drain(pending.PREFIX_GONG, domain_key):
+            content = payload.get('content', '')
+            if not content:
+                pending.delete(pending.PREFIX_GONG, domain_key, key)
+                continue
+            try:
+                target_doc_id = append_to_doc(
+                    doc_ids, content,
+                    current_text_bytes=len(customer_text_cache[domain_key].encode('utf-8')),
+                )
+                customer_text_cache[domain_key] += content
+                pending.delete(pending.PREFIX_GONG, domain_key, key)
+                drained += 1
+                print(f"Drained pending call {payload.get('id')} -> {target_doc_id}")
+            except DocFullError as e:
+                # Doc list is still capped. Alert once and stop
+                # draining this customer; remaining items stay in GCS
+                # for the next run after the operator extends the list.
+                print(f"Drain hit cap on {domain_key} (doc {e.doc_id}, {e.current_bytes} bytes)")
+                pending_count = pending.count(pending.PREFIX_GONG, domain_key)
+                alerts.send_doc_full_alert(
+                    customer_label=entry.get('customerName') or domain_key,
+                    customer_key=domain_key,
+                    doc_ids=doc_ids,
+                    pending_count=pending_count,
+                    service='gong',
+                    alerted_customers=alerted_customers,
+                )
+                break
+            except Exception as e:
+                print(f"Drain failed for pending {key}: {e}")
+                # Leave the blob in GCS, try again next run.
+                continue
+
+    if drained:
+        print(f"Drained {drained} pending call(s)")
+    return drained
+
+
+def process_calls(calls, account_filter=None, customer_text_cache=None, alerted_customers=None):
+    """Fetch details + transcripts for `calls` and append each to its doc list.
+
+    Dedup is content-based against the concatenated text of all docs
+    in the customer's list. The cache is keyed by `domain_key` (the
+    matched account-mapping key) so multiple docs share one entry.
+
+    On `DocFullError`, the formatted call block is enqueued to
+    `shared.pending` under partition=domain_key and a one-per-run
+    alert is fired via `shared.alerts.send_doc_full_alert`. Returns
+    `(processed_count, errors, skipped_accounts, skipped_dupes,
+    buffered_count)`.
+
+    Caller can pre-seed `customer_text_cache` (we use it for dedup
+    and mutate it on success) and `alerted_customers` (which we use
+    AND mutate via shared.alerts).
+    """
+    if customer_text_cache is None:
+        customer_text_cache = {}
+    if alerted_customers is None:
+        alerted_customers = set()
+
     if not calls:
-        return (0, [], {}, 0, {})
+        return (0, [], {}, 0, 0)
 
     print(f"Processing {len(calls)} calls" + (f" (filter: {account_filter})" if account_filter else ""))
 
@@ -140,9 +281,9 @@ def process_calls(calls, account_filter=None):
 
     processed_count = 0
     skipped_dupes = 0
+    buffered_count = 0
     errors = []
     skipped_accounts = {}
-    doc_text_cache = {}
 
     for call in calls:
         call_id = call.get("id")
@@ -164,22 +305,20 @@ def process_calls(calls, account_filter=None):
                 if not match:
                     continue
 
-            mapping = find_mapping_for_account(account_id, account_name)
+            domain_key, mapping = find_mapping_for_account(account_id, account_name)
             if not mapping:
                 key = account_name or account_id
                 skipped_accounts[key] = skipped_accounts.get(key, 0) + 1
                 print(f"No mapping found for account '{account_name}' (ID: {account_id}), skipping")
                 continue
 
-            doc_id = mapping.get("docId")
+            doc_ids = parse_id_list(mapping.get("docId", ""))
+            if not doc_ids:
+                print(f"Mapping for '{domain_key}' has empty docId, skipping call {call_id}")
+                continue
 
-            if doc_id not in doc_text_cache:
-                try:
-                    doc_text_cache[doc_id] = get_doc_text(doc_id)
-                    print(f"Cached doc text for {doc_id} ({len(doc_text_cache[doc_id])} chars)")
-                except Exception as e:
-                    print(f"Could not read doc {doc_id} for dedup, proceeding without: {e}")
-                    doc_text_cache[doc_id] = ""
+            _seed_customer_cache(domain_key, doc_ids, customer_text_cache)
+            existing_text = customer_text_cache[domain_key]
 
             call_title = details.get("metaData", {}).get("title", "Untitled Call")
             call_started = details.get("metaData", {}).get("started", "")
@@ -192,8 +331,8 @@ def process_calls(calls, account_filter=None):
                     dedup_date = call_started
 
             dedup_key = f"GONG CALL: {call_title}"
-            if dedup_key in doc_text_cache[doc_id] and dedup_date and dedup_date in doc_text_cache[doc_id]:
-                print(f"Skipping duplicate call '{call_title}' already in doc {doc_id}")
+            if dedup_key in existing_text and dedup_date and dedup_date in existing_text:
+                print(f"Skipping duplicate call '{call_title}' (already in {domain_key}'s docs)")
                 skipped_dupes += 1
                 continue
 
@@ -213,11 +352,38 @@ def process_calls(calls, account_filter=None):
             }
 
             doc_content = format_call_for_doc(call_info, formatted_transcript, summary)
-            append_to_doc(doc_id, doc_content)
 
-            # Keep the cache in sync so later calls in this run also dedup.
-            doc_text_cache[doc_id] += doc_content
+            try:
+                append_to_doc(
+                    doc_ids, doc_content,
+                    current_text_bytes=len(existing_text.encode('utf-8')),
+                )
+            except DocFullError as e:
+                print(f"Doc full for {domain_key} (doc {e.doc_id}); buffering call '{call_title}'")
+                try:
+                    pending.enqueue(
+                        pending.PREFIX_GONG, domain_key, doc_content,
+                        meta={'call_id': call_id, 'title': call_title},
+                        unique_id=call_id,
+                    )
+                    buffered_count += 1
+                except Exception as enqueue_err:
+                    err_msg = f"Failed to buffer call {call_id}: {enqueue_err}"
+                    print(err_msg)
+                    errors.append(err_msg)
+                    continue
+                pending_count = pending.count(pending.PREFIX_GONG, domain_key)
+                alerts.send_doc_full_alert(
+                    customer_label=mapping.get('customerName') or domain_key,
+                    customer_key=domain_key,
+                    doc_ids=doc_ids,
+                    pending_count=pending_count,
+                    service='gong',
+                    alerted_customers=alerted_customers,
+                )
+                continue
 
+            customer_text_cache[domain_key] = existing_text + doc_content
             print(f"Successfully synced call '{call_title}' for '{account_name}'")
             processed_count += 1
 
@@ -228,8 +394,10 @@ def process_calls(calls, account_filter=None):
 
     if skipped_dupes:
         print(f"Skipped {skipped_dupes} duplicate calls already in docs")
+    if buffered_count:
+        print(f"Buffered {buffered_count} calls to GCS pending-calls/")
 
-    return (processed_count, errors, skipped_accounts, skipped_dupes, doc_text_cache)
+    return (processed_count, errors, skipped_accounts, skipped_dupes, buffered_count)
 
 
 def gong_sync(request):
@@ -250,6 +418,11 @@ def gong_sync(request):
     if account_filter:
         print(f"Account filter: {account_filter}")
 
+    customer_text_cache = {}
+    alerted_customers = set()
+
+    drained = _drain_pending(customer_text_cache, alerted_customers)
+
     if backfill_mode:
         days = int(args.get('days', 90))
         print(f"Backfill: fetching calls from the last {days} days")
@@ -261,28 +434,30 @@ def gong_sync(request):
         print(f"Normal mode: fetching calls from the last {hours} hours")
         calls = get_calls_since(hours_ago=hours)
 
-    if not calls:
-        print("No calls found in the specified time range.")
-        return {"message": "No calls to process", "processed": 0}, 200
-
-    print(f"Found {len(calls)} calls to process")
-
-    processed_count, errors, skipped_accounts, skipped_dupes, doc_text_cache = process_calls(
+    processed_count, errors, skipped_accounts, skipped_dupes, buffered_count = process_calls(
         calls, account_filter,
+        customer_text_cache=customer_text_cache,
+        alerted_customers=alerted_customers,
     )
 
+    # Always run date-range writeback - even if we processed zero new
+    # calls, drains may have happened, and existing docs accumulated
+    # from previous runs still need their first/last-call-recorded
+    # cells initialised on first deploy. _write_call_date_ranges
+    # reads docs FRESH so buffered (un-appended) calls don't leak
+    # into the date columns.
     try:
-        _write_calls_scraped_column(doc_text_cache)
+        _write_call_date_ranges()
     except Exception as e:
-        # Don't fail the sync if the sheet write fails - the next run
-        # will recompute the absolute count. Just log and carry on.
-        print(f"Error writing 'calls-scraped' column: {e}")
+        print(f"Error writing call date ranges: {e}")
 
     result = {
         "message": f"Processed {processed_count} calls",
         "processed": processed_count,
+        "drained": drained,
+        "buffered": buffered_count,
         "skipped_dupes": skipped_dupes,
-        "total_found": len(calls),
+        "total_found": len(calls) if calls else 0,
         "skipped_accounts": skipped_accounts or None,
         "errors": errors or None,
     }
@@ -291,57 +466,100 @@ def gong_sync(request):
     return result, 200
 
 
-def _write_calls_scraped_column(doc_text_cache):
-    """Set 'calls-scraped' on the gong tab to the number of GONG CALL
-    headers currently in each doc we touched this run.
+def _parse_call_date(date_str):
+    """Parse the human format format_call_for_doc emits, or return None.
 
-    Idempotent by construction: always writes the absolute count
-    derived from the doc text, never a delta. Silent no-op if the
-    column header isn't on the sheet or if the cache is empty.
-
-    Cold accounts (rows whose doc wasn't touched this run) are
-    skipped - doc_text_cache only contains docs we actually read, so
-    for untouched docs we don't have a verified count.
+    Date strings in the doc look like "July 04, 2025 at 03:30 PM". A
+    handful of older blocks may carry the raw ISO string if the
+    format_call_for_doc fallback fired; we accept those too.
     """
-    if not doc_text_cache:
-        return
+    for fmt in ("%B %d, %Y at %I:%M %p",):
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
 
-    counts_by_doc = {
-        doc_id: text.count(HEADER_PREFIX)
-        for doc_id, text in doc_text_cache.items()
-    }
 
-    mapping = get_account_mapping()
+def _extract_call_dates(doc_text):
+    """Pull every `Date: ...` line that follows a GONG CALL header.
 
+    Returns a list of `datetime` objects. Unparseable date strings are
+    silently dropped so one bad block doesn't poison the whole row.
+    """
+    dates = []
+    for match in _DATE_RE.finditer(doc_text):
+        dt = _parse_call_date(match.group(1).strip())
+        if dt is not None:
+            dates.append(dt)
+    return dates
+
+
+def _write_call_date_ranges():
+    """Update first-call-recorded / last-call-recorded for every gong row.
+
+    Reads each row's `document-id` cell (parse_id_list - one or many
+    docs), fetches the FRESH plaintext of every doc, runs the anchored
+    `_DATE_RE` over the concatenation, and writes the min/max dates
+    back as `MM/DD/YYYY`.
+
+    Reads docs fresh (NOT from the in-process customer_text_cache) so
+    calls that were buffered to GCS this run - i.e. not actually
+    appended to the doc - do NOT show up in the date range. The whole
+    point of the cap-hit alert is that the operator can trust this
+    column reflects what's in the doc.
+
+    Silent no-op if neither column header is on the sheet, or if no
+    rows have any matchable dates. Errors per-row are logged and the
+    row is skipped so one unreadable doc doesn't sink the batch.
+    """
     rows = read_tab(SHEET_ID, GONG_TAB)
     if not rows:
         return
 
     headers = [h for h in rows[0].keys() if h != '_row_index']
-    col = get_column_letter(headers, CALLS_SCRAPED_COLUMN)
-    if not col:
+    first_col = get_column_letter(headers, FIRST_CALL_COLUMN)
+    last_col = get_column_letter(headers, LAST_CALL_COLUMN)
+    if not first_col and not last_col:
         print(
-            f"Sheet has no '{CALLS_SCRAPED_COLUMN}' column; skipping write. "
-            "Add the column header to the gong tab to enable this feature."
+            f"Sheet has neither '{FIRST_CALL_COLUMN}' nor '{LAST_CALL_COLUMN}' column; "
+            "skipping date-range write."
         )
         return
 
     updates = []
     for row in rows:
-        key = row.get('customer-email-domain', '').strip()
-        if not key:
+        doc_ids = parse_id_list(row.get('document-id', ''))
+        if not doc_ids:
             continue
-        entry = mapping.get(key)
-        if not entry:
+
+        text_parts = []
+        for doc_id in doc_ids:
+            try:
+                text_parts.append(get_doc_text(doc_id))
+            except Exception as e:
+                print(f"Skipping doc {doc_id} for date range: {e}")
+        if not text_parts:
             continue
-        doc_id = entry.get('docId')
-        if doc_id not in counts_by_doc:
+        text = "".join(text_parts)
+        dates = _extract_call_dates(text)
+        if not dates:
             continue
-        updates.append((f"{GONG_TAB}!{col}{row['_row_index']}", counts_by_doc[doc_id]))
+
+        first_str = min(dates).strftime('%m/%d/%Y')
+        last_str = max(dates).strftime('%m/%d/%Y')
+
+        if first_col:
+            updates.append((f"{GONG_TAB}!{first_col}{row['_row_index']}", first_str))
+        if last_col:
+            updates.append((f"{GONG_TAB}!{last_col}{row['_row_index']}", last_str))
 
     if updates:
         batch_update_values(SHEET_ID, updates)
-        print(f"Updated '{CALLS_SCRAPED_COLUMN}' on {len(updates)} row(s)")
+        print(f"Updated first/last-call-recorded on {len(updates)} cell(s)")
 
 
 if __name__ == '__main__':
