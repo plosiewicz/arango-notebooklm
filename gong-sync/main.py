@@ -35,6 +35,8 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
+import requests as http_requests
+
 from gong_api import (
     format_transcript,
     get_account_info_from_call,
@@ -55,6 +57,22 @@ from shared.sheets import (
 )
 
 MAPPING_BLOB = 'account-mapping.json'
+
+# Self-URL of the deployed Cloud Function. Used by the full_backfill_all
+# dispatcher to fire short-timeout requests at our own ?full_backfill
+# endpoint, one per account, so each backfill runs in its own 540s
+# budget instead of all serializing inside this one invocation.
+GONG_SYNC_URL = os.environ.get(
+    'GONG_SYNC_URL',
+    'https://us-central1-slack-notebooklm-sync.cloudfunctions.net/gong-sync',
+)
+DISPATCH_TIMEOUT_SECONDS = 5
+
+# Full-backfill window. Gong retention is account-configurable but
+# typically <= 24 months; 5 years gives plenty of headroom for the
+# longest plausible retention without making us guess. Calls Gong
+# doesn't have are simply absent from the response.
+FULL_BACKFILL_DAYS = 5 * 365
 
 # Onboarding sheet: same sheet config-sync reads to build the
 # account-mapping.json blob. We write the first/last-call-recorded
@@ -400,21 +418,66 @@ def process_calls(calls, account_filter=None, customer_text_cache=None, alerted_
     return (processed_count, errors, skipped_accounts, skipped_dupes, buffered_count)
 
 
+def _dispatch_full_backfill_all():
+    """Fire short-timeout requests at our own ?full_backfill endpoint.
+
+    One dispatch per mapped account, so each customer's backfill runs
+    in its own Cloud Function invocation (540s each). We don't wait
+    for them to finish - the timeout is just long enough to confirm
+    the request was accepted.
+
+    Returns the list of (account, status) tuples for the response body
+    so the operator can spot DNS / IAM failures.
+    """
+    mapping = get_account_mapping()
+    print(f"full_backfill_all: dispatching to {len(mapping)} account(s)")
+    results = []
+    for domain in sorted(mapping.keys()):
+        try:
+            resp = http_requests.get(
+                GONG_SYNC_URL,
+                params={'full_backfill': 'true', 'account': domain},
+                timeout=DISPATCH_TIMEOUT_SECONDS,
+            )
+            status = 'dispatched'
+            print(f"  {domain}: HTTP {resp.status_code}")
+        except http_requests.Timeout:
+            status = 'dispatched'
+            print(f"  {domain}: timeout (fire-and-forget, sync continues)")
+        except Exception as e:
+            status = f"error: {e}"
+            print(f"  {domain}: {status}")
+        results.append({'account': domain, 'status': status})
+    return results
+
+
 def gong_sync(request):
     """Cloud Function entry point.
 
     Query params:
-      backfill=true    pull calls from the last `days` days (default 90)
-      hours=N          normal mode: pull calls from the last N hours (default 2)
-      days=N           only used when backfill=true (default 90)
-      account=<key>    restrict processing to one account key
+      hours=N             normal mode: pull calls from the last N hours (default 2)
+      backfill=true       fixed-window backfill of the last `days` days (default 90)
+      days=N              only used with backfill=true
+      full_backfill=true  whole-retention backfill for ONE account; pair
+                          with account=<domain>. Walks FULL_BACKFILL_DAYS
+                          (5 years) so we capture everything Gong holds.
+      full_backfill_all=true
+                          dispatcher: fires fire-and-forget requests at
+                          our own ?full_backfill endpoint, once per
+                          mapped account. Returns immediately.
+      account=<key>       restrict processing to one account key
     """
     args = request.args if hasattr(request, 'args') else {}
 
+    if args.get('full_backfill_all', '').lower() == 'true':
+        return {'dispatched': _dispatch_full_backfill_all()}, 200
+
     backfill_mode = args.get('backfill', 'false').lower() == 'true'
+    full_backfill_mode = args.get('full_backfill', '').lower() == 'true'
     account_filter = args.get('account', '').strip() or None
 
-    print(f"Starting Gong sync at {datetime.now(timezone.utc).isoformat()} (backfill={backfill_mode})")
+    print(f"Starting Gong sync at {datetime.now(timezone.utc).isoformat()} "
+          f"(backfill={backfill_mode}, full_backfill={full_backfill_mode})")
     if account_filter:
         print(f"Account filter: {account_filter}")
 
@@ -423,7 +486,13 @@ def gong_sync(request):
 
     drained = _drain_pending(customer_text_cache, alerted_customers)
 
-    if backfill_mode:
+    if full_backfill_mode:
+        days = FULL_BACKFILL_DAYS
+        print(f"Full backfill: fetching last {days} days for {account_filter or 'ALL'}")
+        to_date = datetime.now(timezone.utc)
+        from_date = to_date - timedelta(days=days)
+        calls = get_calls_in_range(from_date, to_date)
+    elif backfill_mode:
         days = int(args.get('days', 90))
         print(f"Backfill: fetching calls from the last {days} days")
         to_date = datetime.now(timezone.utc)

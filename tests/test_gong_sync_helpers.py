@@ -451,6 +451,61 @@ def test_drain_pending_appends_then_deletes(gong_main, monkeypatch):
     assert "BLOCK2" in cache["acme.com"]
 
 
+def test_full_backfill_all_dispatches_one_per_account(gong_main, monkeypatch):
+    """Dispatcher fires short-timeout requests, one per mapped account.
+    The timeout itself is treated as success (fire-and-forget)."""
+    monkeypatch.setattr(gong_main, "get_account_mapping", lambda: {
+        "acme.com": {"docId": "doc-A"},
+        "widgets.io": {"docId": "doc-B"},
+        "zenith.dev": {"docId": "doc-C"},
+    })
+
+    fake_get = MagicMock(return_value=MagicMock(status_code=200))
+    monkeypatch.setattr(gong_main.http_requests, "get", fake_get)
+
+    out = gong_main._dispatch_full_backfill_all()
+
+    assert sorted(r["account"] for r in out) == ["acme.com", "widgets.io", "zenith.dev"]
+    assert all(r["status"] == "dispatched" for r in out)
+    assert fake_get.call_count == 3
+    for call in fake_get.call_args_list:
+        assert call.kwargs["params"]["full_backfill"] == "true"
+        assert call.kwargs["timeout"] == gong_main.DISPATCH_TIMEOUT_SECONDS
+
+
+def test_full_backfill_all_treats_timeout_as_dispatched(gong_main, monkeypatch):
+    monkeypatch.setattr(gong_main, "get_account_mapping", lambda: {"acme.com": {"docId": "doc-A"}})
+
+    def boom(*a, **kw):
+        raise gong_main.http_requests.Timeout("simulated")
+    monkeypatch.setattr(gong_main.http_requests, "get", boom)
+
+    out = gong_main._dispatch_full_backfill_all()
+    assert out == [{"account": "acme.com", "status": "dispatched"}]
+
+
+def test_gong_sync_full_backfill_all_short_circuits(gong_main, monkeypatch):
+    """The dispatcher path returns immediately - no drain, no get_calls."""
+    dispatched = MagicMock(return_value=[{"account": "x", "status": "dispatched"}])
+    monkeypatch.setattr(gong_main, "_dispatch_full_backfill_all", dispatched)
+
+    drain_mock = MagicMock()
+    monkeypatch.setattr(gong_main, "_drain_pending", drain_mock)
+    calls_mock = MagicMock()
+    monkeypatch.setattr(gong_main, "get_calls_in_range", calls_mock)
+    monkeypatch.setattr(gong_main, "get_calls_since", calls_mock)
+
+    req = MagicMock()
+    req.args = {"full_backfill_all": "true"}
+
+    body, status = gong_main.gong_sync(req)
+    assert status == 200
+    assert body == {"dispatched": [{"account": "x", "status": "dispatched"}]}
+    drain_mock.assert_not_called()
+    calls_mock.assert_not_called()
+    dispatched.assert_called_once()
+
+
 def test_drain_pending_breaks_partition_on_doc_full(gong_main, monkeypatch):
     """First DocFullError stops drain for that partition; remaining
     items stay in GCS (no delete) and one alert fires."""

@@ -34,6 +34,7 @@ import os
 import time
 from datetime import datetime
 
+import requests as http_requests
 from slack_sdk import WebClient
 
 from shared import alerts, pending
@@ -43,6 +44,16 @@ from shared.secrets import get_secret
 from shared.sheets import parse_id_list
 
 MAPPING_BLOB = 'channel-mapping.json'
+
+# Self-URL of the deployed Cloud Function. Used by the full_backfill_all
+# dispatcher to fire short-timeout requests at our own ?backfill endpoint,
+# one per channel, so each backfill runs in its own 540s budget instead
+# of all serializing inside a single invocation.
+SLACK_SYNC_URL = os.environ.get(
+    'SLACK_SYNC_URL',
+    'https://us-central1-slack-notebooklm-sync.cloudfunctions.net/slack-sync',
+)
+DISPATCH_TIMEOUT_SECONDS = 5
 
 # Per-process caches. _user_cache survives across invocations on a
 # warm container; the doc-text cache below is rebuilt on each webhook
@@ -355,6 +366,41 @@ def drain_channel(channel_id, mapping):
     return {"channel": channel_id, "drained": drained}
 
 
+def _dispatch_full_backfill_all():
+    """Fire short-timeout requests at our own ?backfill endpoint.
+
+    One dispatch per mapped channel, so each customer's backfill runs
+    in its own Cloud Function invocation (540s each). The timeout is
+    just long enough to confirm the request was accepted; we don't
+    wait for completion. omitting `oldest` lets backfill_channel
+    default to channel.created.
+    """
+    mapping = get_channel_mapping()
+    print(f"full_backfill_all: dispatching to {len(mapping)} channel(s)")
+    results = []
+    for channel_id in sorted(mapping.keys()):
+        try:
+            resp = http_requests.get(
+                SLACK_SYNC_URL,
+                params={'backfill': 'true', 'channel': channel_id},
+                timeout=DISPATCH_TIMEOUT_SECONDS,
+            )
+            status = 'dispatched'
+            print(f"  {channel_id}: HTTP {resp.status_code}")
+        except http_requests.Timeout:
+            status = 'dispatched'
+            print(f"  {channel_id}: timeout (fire-and-forget, sync continues)")
+        except Exception as e:
+            status = f"error: {e}"
+            print(f"  {channel_id}: {status}")
+        results.append({'channel': channel_id, 'status': status})
+    return results
+
+
+def handle_full_backfill_all(_request):
+    return {'dispatched': _dispatch_full_backfill_all()}, 200
+
+
 def handle_drain(_request):
     """Drain every `pending-messages/<partition>/` we can find.
 
@@ -490,6 +536,8 @@ def slack_webhook(request):
     """
     if request.method == 'GET':
         args = request.args if hasattr(request, 'args') else {}
+        if args.get('full_backfill_all', '').lower() == 'true':
+            return handle_full_backfill_all(request)
         if args.get('backfill', '').lower() == 'true':
             return handle_backfill(request)
         if args.get('drain', '').lower() == 'true':

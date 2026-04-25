@@ -288,6 +288,39 @@ def test_handle_drain_skips_partitions_without_mapping(slack_main, monkeypatch):
 # -----------------------------------------------------------------------------
 
 
+def test_full_backfill_all_dispatches_one_per_channel(slack_main, monkeypatch):
+    monkeypatch.setattr(slack_main, "get_channel_mapping", lambda: {
+        "C1": {"docId": "doc-A"},
+        "C2": {"docId": "doc-B"},
+    })
+    fake_get = MagicMock(return_value=MagicMock(status_code=200))
+    monkeypatch.setattr(slack_main.http_requests, "get", fake_get)
+
+    out = slack_main._dispatch_full_backfill_all()
+
+    assert sorted(r["channel"] for r in out) == ["C1", "C2"]
+    assert all(r["status"] == "dispatched" for r in out)
+    assert fake_get.call_count == 2
+    for call in fake_get.call_args_list:
+        params = call.kwargs["params"]
+        assert params["backfill"] == "true"
+        assert "oldest" not in params  # default to channel.created
+        assert call.kwargs["timeout"] == slack_main.DISPATCH_TIMEOUT_SECONDS
+
+
+def test_slack_webhook_routes_full_backfill_all(slack_main, monkeypatch):
+    handle_mock = MagicMock(return_value=({"dispatched": []}, 200))
+    monkeypatch.setattr(slack_main, "handle_full_backfill_all", handle_mock)
+
+    req = MagicMock()
+    req.method = 'GET'
+    req.args = {'full_backfill_all': 'true'}
+
+    body, status = slack_main.slack_webhook(req)
+    assert status == 200
+    handle_mock.assert_called_once()
+
+
 def test_slack_webhook_routes_drain_get(slack_main, monkeypatch):
     monkeypatch.setattr(slack_main, "handle_drain", lambda r: ({"drained": 0}, 200))
     monkeypatch.setattr(slack_main, "handle_backfill", lambda r: pytest_fail("backfill should not be called"))
