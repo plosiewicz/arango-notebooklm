@@ -1,29 +1,36 @@
-"""SendGrid wrapper for doc-cap-hit operator alerts.
+"""Doc-cap-hit operator alert.
 
-The alert is a plain-text email to `ALERT_EMAIL` saying "customer X's
-doc list is full, calls/messages are being buffered to GCS until you
-add a new doc id to the sheet". The operator's runbook
-(see ARCHITECTURE.md "Cap-hit runbook") covers the manual steps.
+Emits a single structured `doc_full` warning whenever the tail Google
+Doc for a customer hits its size cap and incoming items are being
+buffered to GCS instead. A Cloud Monitoring log-based alert filters
+on `jsonPayload.event="doc_full"` and routes the match to the
+operator's email notification channel; this module knows nothing
+about email or Cloud Monitoring -- it just logs.
 
-Hard contract: this module NEVER raises. SendGrid outage, missing
-secret, rate limit, malformed `to` address - all surface as a logged
-warning and a `False` return. Callers (gong-sync, drain workers)
-treat the alert as best-effort: the data is already safe in GCS, the
-email is just a nudge.
+On Cloud Functions Gen 2 (current target -- see deploy.sh `--gen2`)
+the `google-cloud-logging` Python handler is auto-attached and
+`extra={"json_fields": {...}}` is hoisted to `jsonPayload.*` for the
+log entry. In local `functions-framework` dev or other stdlib-only
+contexts the same line still appears as a plain WARNING with the
+key fields embedded in the message string, so it remains searchable.
+
+Hard contract: this module NEVER raises. A logging-stack hiccup
+falls back to a `print()` ops note; callers (gong-sync, drain
+workers, slack-sync backfill / drain) treat the alert as
+best-effort. The data is already safe in GCS; the alert is just a
+nudge.
 
 Frequency: callers pass an `alerted_customers` set keyed however
-they like (domain for gong, channel id for slack). `send_doc_full_alert`
-checks-and-adds atomically per call so an over-eager loop can't
-spam the same customer twice in one run.
+they like (domain for gong, channel id for slack).
+`send_doc_full_alert` checks-and-adds atomically per call so an
+over-eager loop can't spam the same customer twice in one run. The
+cross-run side -- "operator gets one ongoing email per cap-hit
+customer until acked" -- is owned by the alert policy's auto-close
+window, not by this module.
 """
-import json
-import os
-from datetime import datetime, timezone
+import logging
 
-from shared.secrets import get_secret
-
-ALERT_EMAIL = os.environ.get('ALERT_EMAIL', '')
-SENDGRID_FROM = os.environ.get('SENDGRID_FROM', '')
+logger = logging.getLogger(__name__)
 
 
 def send_doc_full_alert(
@@ -35,82 +42,50 @@ def send_doc_full_alert(
     service,
     alerted_customers=None,
 ):
-    """Send (or skip) the doc-full alert. Returns True if a request was sent.
+    """Emit (or skip) the doc-full alert log line.
+
+    Returns True if a record was emitted, False if it was deduped or
+    the logging call itself failed.
 
     Args:
-      customer_label:  human-friendly name for the email body ("Acme")
-      customer_key:    de-dup key for `alerted_customers` (domain or channel id)
-      doc_ids:         list of currently-mapped doc ids (the operator
-                       needs this so they know which doc to extend)
+      customer_label:  human-friendly name ("Acme") for the message
+      customer_key:    de-dup key for `alerted_customers`
+                       (domain for gong, channel id for slack)
+      doc_ids:         list of currently-mapped doc ids
       pending_count:   how many items are currently buffered in GCS
-      service:         "gong" or "slack" (shows up in the email subject)
-      alerted_customers: optional set; if provided, this function
+      service:         "gong" or "slack"
+      alerted_customers: optional set; if provided, the function
                        no-ops when `customer_key` is already in it,
-                       and adds it before returning.
+                       and adds it BEFORE emitting so a logging hang
+                       on this customer can't re-enter the same run.
 
-    Never raises. Logs and returns False on any failure.
+    Never raises.
     """
     if alerted_customers is not None:
         if customer_key in alerted_customers:
             return False
-        # Add BEFORE sending so a SendGrid hang on this customer
-        # doesn't generate a second attempt later in the same run.
         alerted_customers.add(customer_key)
 
-    if not ALERT_EMAIL:
-        print(f"[alerts] ALERT_EMAIL unset, skipping doc-full alert for {customer_label}")
-        return False
-    if not SENDGRID_FROM:
-        print(f"[alerts] SENDGRID_FROM unset, skipping doc-full alert for {customer_label}")
-        return False
+    doc_ids_list = list(doc_ids or [])
 
     try:
-        api_key = get_secret('sendgrid-api-key')
-    except Exception as e:
-        print(f"[alerts] Could not load sendgrid-api-key: {e}")
-        return False
-
-    subject = f"[notebooklm] {service} doc full for {customer_label}"
-    body = (
-        f"Customer: {customer_label} ({customer_key})\n"
-        f"Service: {service}\n"
-        f"Mapped doc ids: {', '.join(doc_ids) if doc_ids else '(none)'}\n"
-        f"Pending items in GCS: {pending_count}\n"
-        f"Detected at: {datetime.now(timezone.utc).isoformat()}\n\n"
-        "The current doc has hit its size cap. New calls/messages are\n"
-        "being buffered in GCS. Please:\n"
-        "  1. Create a new Google Doc and share it with the service account.\n"
-        "  2. Append the new doc id to the customer's row in the sheet,\n"
-        "     comma-separated, e.g. 'doc-old,doc-new'.\n"
-        "  3. The next config-sync run picks it up and the buffered items\n"
-        "     drain automatically.\n"
-    )
-
-    payload = {
-        'personalizations': [{'to': [{'email': ALERT_EMAIL}]}],
-        'from': {'email': SENDGRID_FROM},
-        'subject': subject,
-        'content': [{'type': 'text/plain', 'value': body}],
-    }
-
-    try:
-        # Local import so the module imports cleanly in environments
-        # that haven't installed `requests` (tests, ruff).
-        import requests
-        resp = requests.post(
-            'https://api.sendgrid.com/v3/mail/send',
-            headers={
-                'Authorization': f'Bearer {api_key}',
-                'Content-Type': 'application/json',
-            },
-            data=json.dumps(payload),
-            timeout=10,
+        logger.warning(
+            "doc_full service=%s customer=%s key=%s doc_ids=%s pending=%d",
+            service,
+            customer_label,
+            customer_key,
+            doc_ids_list,
+            pending_count,
+            extra={"json_fields": {
+                "event": "doc_full",
+                "service": service,
+                "customer_label": customer_label,
+                "customer_key": customer_key,
+                "doc_ids": doc_ids_list,
+                "pending_count": pending_count,
+            }},
         )
-        if resp.status_code >= 400:
-            print(f"[alerts] SendGrid {resp.status_code}: {resp.text[:200]}")
-            return False
-        print(f"[alerts] Sent doc-full alert for {customer_label}")
         return True
     except Exception as e:
-        print(f"[alerts] SendGrid request failed: {e}")
+        print(f"[alerts] log emit failed: {e}")
         return False

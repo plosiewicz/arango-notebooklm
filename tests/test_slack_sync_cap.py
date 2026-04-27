@@ -64,7 +64,7 @@ def test_webhook_dedup_text_invalidates_when_doc_ids_change(slack_main, monkeypa
 
 
 # -----------------------------------------------------------------------------
-# _handle_webhook_message: buffer-only on DocFullError, no SendGrid
+# _handle_webhook_message: buffer-only on DocFullError, no alert call
 # -----------------------------------------------------------------------------
 
 

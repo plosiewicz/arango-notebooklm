@@ -21,11 +21,11 @@ older doc.
 Cap-hit on the webhook hot path:
 
 The Slack Events API retries if it doesn't see a 200 within 3 seconds.
-SendGrid + concatenated multi-doc reads can each blow that budget, so
-the webhook keeps a small in-process cache keyed by channel_id and
-SKIPS the alert call - it just buffers the formatted message to GCS
-and returns. The hourly drain (kicked by config-sync) is what fires
-the alert and actually empties the queue.
+Concatenated multi-doc reads on dedup can already blow that budget,
+so the webhook keeps a small in-process cache keyed by channel_id and
+SKIPS the doc_full alert log line entirely - it just buffers the
+formatted message to GCS and returns. The hourly drain (kicked by
+config-sync) is what emits the alert and actually empties the queue.
 """
 import hashlib
 import hmac
@@ -322,9 +322,9 @@ def drain_channel(channel_id, mapping):
     """Drain `pending-messages/<channel_id>/` to the customer's doc list.
 
     Stops on the first DocFullError per channel - subsequent items
-    would just hit the same wall. Fires one SendGrid alert if a
-    cap-hit is observed (this path is NOT the webhook hot path so
-    we don't have a 3-second budget).
+    would just hit the same wall. Emits one doc_full alert log line
+    if a cap-hit is observed (this path is NOT the webhook hot path
+    so we don't have a 3-second budget).
     """
     doc_ids = parse_id_list(mapping.get('docId', ''))
     if not doc_ids:
@@ -472,7 +472,7 @@ def _webhook_dedup_text(channel_id, doc_ids):
 
 def _handle_webhook_message(event, mapping):
     """Append (or buffer) a single Slack message. Webhook-budget aware:
-    no SendGrid alerts on this path - the hourly drain owns alerting.
+    no doc_full alerts on this path - the hourly drain owns alerting.
     """
     channel_id = event.get('channel')
     user_id = event.get('user')

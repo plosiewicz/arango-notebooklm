@@ -154,8 +154,13 @@ Why three separate things (pytest + ruff + shellcheck):
   service does `from shared.secrets import get_secret` which creates
   a local binding. Same applies to `read_tab` / `batch_update_values`
   / `write_cell` / `append_to_doc` / `get_doc_text` /
-  `pending.{enqueue,drain,delete,count,list_partitions}` /
-  `alerts.send_doc_full_alert` in service modules that import them.
+  `pending.{enqueue,drain,delete,count,list_partitions}` in service
+  modules that import them.
+- `shared.alerts.send_doc_full_alert` is unconditionally
+  side-effect-free (just a `logger.warning`) and does NOT need to be
+  mocked. Tests under `tests/test_shared_alerts.py` use `caplog` to
+  assert on the emitted record. Other tests can let the real call
+  run.
 - Keep tests pure: no real network, no real GCS, no real Secret
   Manager. Orchestration-level tests for `process_*` remain out of
   scope until we next need them.

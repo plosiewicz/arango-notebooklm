@@ -41,7 +41,7 @@ existing-customer sweep.
 │   ├── secrets.py             get_secret (Secret Manager wrapper)
 │   ├── sheets.py              read_tab, write_cell, get_column_letter, batch_update_values, parse_id_list
 │   ├── pending.py             GCS-backed FIFO buffer for cap-hit calls/messages
-│   └── alerts.py              SendGrid wrapper for doc-full operator alerts
+│   └── alerts.py              structured doc_full log line (Cloud Monitoring picks it up)
 ├── tests/                     pytest suite (Tier 0 + Tier 1)
 ├── slack-sync/
 │   ├── main.py                webhook + backfill + drain + sweep
@@ -107,16 +107,13 @@ All three:
 Any trailing args pass through to `gcloud functions deploy`, so you
 can e.g. `./deploy.sh slack --update-env-vars=FOO=bar`.
 
-First time deploying this version, set `ALERT_EMAIL` and
-`SENDGRID_FROM` on the two sync services so the doc-full alerts can
-fire:
-
-```bash
-gcloud functions deploy gong-sync \
-  --update-env-vars=ALERT_EMAIL=ops@yourcompany.com,SENDGRID_FROM=noreply@yourcompany.com
-gcloud functions deploy slack-sync \
-  --update-env-vars=ALERT_EMAIL=ops@yourcompany.com,SENDGRID_FROM=noreply@yourcompany.com
-```
+First time deploying this version, also set up the Cloud Monitoring
+log-based alert for `doc_full` so cap-hit notifications land in your
+inbox. There's no env var or secret to set on the functions
+themselves -- everything is wired in the GCP console. See
+[ARCHITECTURE.md "Configure the doc_full alert policy"](./ARCHITECTURE.md#configure-the-doc_full-alert-policy)
+for the exact filter, channel, and a `gcloud logging write` smoke
+test.
 
 ---
 
@@ -130,7 +127,6 @@ All three services pull credentials from Secret Manager via
 | `gong-api-key` | gong-sync | `accessKeyId:accessKeySecret` |
 | `slack-bot-token` | slack-sync | `xoxb-...` |
 | `slack-signing-secret` | slack-sync | hex string |
-| `sendgrid-api-key` | gong-sync, slack-sync (via `shared.alerts`) | SendGrid API key |
 
 View / rotate a secret:
 
@@ -201,10 +197,11 @@ slack-sync / gong-sync read the GCS mapping on every request with a
 
 ### When a doc hits the cap
 
-A SendGrid email lands in `ALERT_EMAIL` saying
-`[notebooklm] <service> doc full for <Customer>`. Calls/messages keep
-landing safely in GCS (`pending-calls/<domain>/`,
-`pending-messages/<channel_id>/`). To resume:
+Cloud Monitoring sends an email saying
+`[notebooklm] doc_full <service> for <Customer>` (subject is
+configurable on the policy). Calls/messages keep landing safely in
+GCS (`pending-calls/<domain>/`, `pending-messages/<channel_id>/`).
+To resume:
 
 1. Create a new Google Doc, share with the service account.
 2. Edit the customer's row: `document-id` becomes `doc-old,doc-new`.
@@ -266,7 +263,7 @@ gcloud functions logs read config-sync --region=us-central1 --project=slack-note
 | gong-sync "skipped_accounts" in logs | Account on the call doesn't match any sheet row | Add the account (email domain, name, or CRM id) to the `gong` tab. |
 | Duplicate Slack messages | Slack retried before the function returned 200 | Function drops `X-Slack-Retry-Num` headers. Check logs. |
 | Sheet row stuck on blank `Config done` | DNS / IAM error during the dispatch (5xx from the sync service is treated as success). | Check `gcloud functions logs read config-sync` for `Failed to dispatch ...`; re-trigger config-sync once the underlying issue is fixed. |
-| `[notebooklm] doc full` email | Customer's tail doc hit 6 MB. Buffered items are safe in GCS. | See [Cap-hit runbook](./ARCHITECTURE.md#cap-hit-runbook). |
+| Cloud Monitoring `doc_full` alert email | Customer's tail doc hit 6 MB. Buffered items are safe in GCS. | See [Cap-hit runbook](./ARCHITECTURE.md#cap-hit-runbook). |
 | `first-call-recorded` / `last-call-recorded` blank | Columns missing from the gong tab, or doc has no parseable `GONG CALL:` blocks yet, or the customer was dormant on the last run. | Add column headers; confirm doc has at least one call; kick `?full_backfill=true&account=<domain>`. |
 | Pending-* objects piling up in GCS | Operator hasn't extended the customer's doc list, or the new doc isn't shared with the SA. | `gsutil ls gs://slack-notebooklm-config/pending-calls/` and `pending-messages/`; resolve per the cap-hit runbook. |
 | NotebookLM source not updating | Doc updated, but NotebookLM cache | Re-index in NotebookLM UI. |

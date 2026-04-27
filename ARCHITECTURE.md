@@ -24,12 +24,16 @@ flowchart LR
 
     subgraph gcp [GCP slack-notebooklm-sync]
         gcs[(GCS bucket<br/>slack-notebooklm-config<br/>+ pending-calls/<br/>+ pending-messages/)]
-        secrets[(Secret Manager<br/>gong-api-key<br/>slack-bot-token<br/>slack-signing-secret<br/>sendgrid-api-key)]
+        secrets[(Secret Manager<br/>gong-api-key<br/>slack-bot-token<br/>slack-signing-secret)]
         configsync[config-sync<br/>Cloud Function]
         slacksync[slack-sync<br/>Cloud Function]
         gongsync[gong-sync<br/>Cloud Function]
         scheduler[Cloud Scheduler<br/>hourly]
-        sendgrid[SendGrid<br/>operator alerts]
+        monitoring[Cloud Monitoring<br/>log-based alert]
+    end
+
+    subgraph alerts [Operator alerts]
+        ops[Operator email]
     end
 
     subgraph out [Customer-facing outputs]
@@ -61,7 +65,9 @@ flowchart LR
     gongsync -- append to last doc id --> docs
     slacksync -- buffer on cap-hit --> gcs
     gongsync -- buffer on cap-hit --> gcs
-    gongsync -- doc-full alert --> sendgrid
+    slacksync -- doc_full warning --> monitoring
+    gongsync -- doc_full warning --> monitoring
+    monitoring -- email --> ops
     docs --> nblm
 ```
 
@@ -100,9 +106,12 @@ Six tiny helpers every service depends on:
   `gs://<bucket>/<prefix>/<partition>/<sortable-key>.json` where
   `prefix` is `pending-calls` (gong) or `pending-messages` (slack)
   and `partition` is the customer email-domain or channel id.
-- `shared.alerts` - `send_doc_full_alert(...)`. SendGrid wrapper that
-  NEVER raises. Optional `alerted_customers` set dedups within a run
-  so an over-eager loop can't spam the same customer twice.
+- `shared.alerts` - `send_doc_full_alert(...)`. Emits a structured
+  `doc_full` WARNING. A Cloud Monitoring log-based alert filters on
+  `jsonPayload.event="doc_full"` and routes the match to email. NEVER
+  raises (a logging-stack hiccup falls back to a `print` ops note).
+  Optional `alerted_customers` set dedups within a run so an
+  over-eager loop can't spam the same customer twice.
 
 Because Cloud Functions can't import from a sibling path, each service's
 `deploy.sh` does `rsync -a --delete ../shared/ ./shared/` before running
@@ -133,8 +142,8 @@ on the same HTTP endpoint:
   6. Appends `[ts] user:\n<text>\n\n` to the LAST doc in the list via
      `append_to_doc`. On `DocFullError` the message is buffered to
      `pending-messages/<channel_id>/<key>.json` in GCS. The webhook
-     does **not** send a SendGrid alert - that would blow the 3s
-     budget; the hourly drain does it instead.
+     does **not** emit the `doc_full` alert log line - keeping the hot
+     path under Slack's 3s budget; the hourly drain owns alerting.
 
 - **Backfill mode (`GET ?backfill=true&channel=<id>[&oldest=<ts>]`)**:
   pages through `conversations.history`, reads the concatenated text
@@ -142,8 +151,9 @@ on the same HTTP endpoint:
   appends new messages to the tail doc. `oldest` defaults to the
   channel's `created` timestamp via `conversations.info` so a fresh
   onboarding captures the entire history. On the FIRST `DocFullError`
-  in this run the operator is alerted once via SendGrid; every
-  subsequent message goes straight to GCS with no doc-side retry.
+  in this run the operator is alerted once via the `doc_full` log
+  line; every subsequent message goes straight to GCS with no
+  doc-side retry.
 
 - **Drain mode (`GET ?drain=true`)**: walks every
   `pending-messages/<channel_id>/` partition that still has a
@@ -199,8 +209,8 @@ After the drain, `process_calls`:
 6. Fetches the transcript, formats it, and appends the whole block
    to the tail doc via `append_to_doc(doc_ids, ..., current_text_bytes=...)`.
    On `DocFullError` the formatted block is enqueued to
-   `pending-calls/<domain>/` and one SendGrid alert is fired per
-   customer per run.
+   `pending-calls/<domain>/` and one `doc_full` alert log line is
+   emitted per customer per run.
 
 After all calls complete, `_write_call_date_ranges` reads the FRESH
 plaintext of every gong-tab row's doc list, extracts every call date
@@ -276,16 +286,15 @@ in lexicographic key order (i.e. enqueue order within ms resolution).
 | `gong-api-key` | gong-sync | `accessKeyId:accessKeySecret` |
 | `slack-bot-token` | slack-sync | `xoxb-...` |
 | `slack-signing-secret` | slack-sync | hex string |
-| `sendgrid-api-key` | gong-sync, slack-sync (via `shared.alerts`) | SendGrid API key |
 
 All accessed via `shared.secrets.get_secret(name)`. The runtime
 service account (`399790122111-compute@developer.gserviceaccount.com`)
 needs `roles/secretmanager.secretAccessor` on each one.
 
-In addition, both gong-sync and slack-sync read the `ALERT_EMAIL`
-and `SENDGRID_FROM` env vars (set on `gcloud functions deploy
---update-env-vars=...`). Missing either disables the alert path
-silently.
+There are no alert-related secrets or env vars on the functions:
+operator alerts go through Cloud Monitoring's log-based alerting,
+configured once in the GCP console (see "Configure the doc_full
+alert policy" below).
 
 ### The Google Sheet
 
@@ -338,10 +347,14 @@ All driven by Cloud Scheduler in `us-central1`:
 When a customer's Google Doc fills up (we cap at 6 MB plaintext to
 stay well clear of Google's 10 MB hard wall):
 
-1. SendGrid sends an email to `ALERT_EMAIL` with subject
-   `[notebooklm] gong doc full for <Customer>` (or `slack`). Body
-   includes the mapped doc ids and the current count of buffered
-   pending items.
+1. Cloud Monitoring fires an alert from the `doc_full` log line and
+   emails the operator. The log entry's `jsonPayload` carries
+   `service`, `customer_label`, `customer_key`, `doc_ids`, and
+   `pending_count`. **Heads up**: a single cap-hit usually creates
+   ONE incident that stays open until auto-close (1 hour by default),
+   not one email per buffered item -- so don't expect a flood of
+   mail. Subsequent runs that re-emit `doc_full` for the same
+   customer get coalesced into the same incident.
 2. New calls/messages for that customer continue to land safely in
    `gs://slack-notebooklm-config/pending-{calls,messages}/<key>/`.
    No data loss.
@@ -450,15 +463,44 @@ What CI does **not** cover today (all Tier 2 candidates):
 and ends with `!shared/` to guarantee the rsynced copy uploads even
 though `shared/` is gitignored inside the service dir.
 
-Set `ALERT_EMAIL` and `SENDGRID_FROM` on gong-sync and slack-sync the
-first time you deploy this version:
+### Configure the doc_full alert policy
+
+One-time setup, in the GCP console (Monitoring -> Alerting -> Create
+Policy) or via `gcloud alpha monitoring policies create`. The
+function-side code already emits the log line; this just wires up
+the email.
+
+Filter (Gen 2 + Gen 1 fallback):
+
+```
+(resource.type="cloud_run_revision" OR resource.type="cloud_function")
+AND jsonPayload.event="doc_full"
+```
+
+Both resource types because Cloud Functions Gen 2 -- the current
+deploy target (every `deploy.sh` uses `--gen2`) -- logs as
+`cloud_run_revision`, and a future Gen 1 redeploy would log as
+`cloud_function`. Belt and suspenders.
+
+- **Trigger condition**: any matching log entry in the rolling
+  window. No threshold.
+- **Auto-close**: 1 hour. A persistent cap-hit re-emits `doc_full`
+  hourly (gong-sync runs hourly; slack-sync drains via config-sync's
+  hourly trigger), so an unresolved incident stays open until the
+  operator extends the doc list.
+- **Notification channel**: email. Verify a channel from
+  Monitoring -> Notification channels first.
+
+Verify with a synthetic log entry (no functions invocation needed):
 
 ```bash
-gcloud functions deploy gong-sync \
-  --update-env-vars=ALERT_EMAIL=ops@yourcompany.com,SENDGRID_FROM=noreply@yourcompany.com
-gcloud functions deploy slack-sync \
-  --update-env-vars=ALERT_EMAIL=ops@yourcompany.com,SENDGRID_FROM=noreply@yourcompany.com
+gcloud logging write notebooklm-test \
+  '{"event":"doc_full","service":"gong","customer_label":"smoke","customer_key":"smoke","doc_ids":["x"],"pending_count":0}' \
+  --severity=WARNING --payload-type=json
 ```
+
+The email should land within ~1 minute. Close the synthetic incident
+afterwards.
 
 ---
 
@@ -472,7 +514,7 @@ gcloud functions deploy slack-sync \
 | `Failed to get credentials from Secret Manager` | SA missing `secretAccessor`, or secret renamed | Secret Manager IAM |
 | gong-sync "skipped_accounts" entries | Gong labels the account differently than the sheet key | `gcloud functions logs read gong-sync`, find what Gong returned, add a row |
 | Sheet row stuck on blank `Config done` after onboarding | Dispatch returned a connection error (DNS / IAM). The dispatch is fire-and-forget so a 5xx from the receiver doesn't block the `Y` flag. | Check `gcloud functions logs read config-sync` for `Failed to dispatch ...`; re-trigger config-sync once the underlying issue is fixed. |
-| `[notebooklm] doc full` email | Customer's tail doc hit 6 MB. Calls/messages still safe in GCS pending. | See "Cap-hit runbook" above. |
+| Cloud Monitoring `doc_full` alert email | Customer's tail doc hit 6 MB. Calls/messages still safe in GCS pending. | See "Cap-hit runbook" above. |
 | `first-call-recorded` / `last-call-recorded` blank | Either the columns are missing from the gong tab, the doc has no parseable headers yet, or this customer was dormant on the last run. | Add the column headers; confirm the doc has at least one `GONG CALL:` block; trigger `?full_backfill=true&account=<domain>` to reseed. |
 | Pending-* objects piling up in GCS | Operator hasn't extended the customer's doc list yet, or the new doc isn't shared with the SA. | `gsutil ls gs://slack-notebooklm-config/pending-calls/` (and `pending-messages/`). Resolve per "Cap-hit runbook". |
 | NotebookLM source stale | Doc is up to date; NotebookLM caches aggressively | re-index in the NotebookLM UI |

@@ -1,56 +1,66 @@
-"""Tests for shared/alerts.py - SendGrid wrapper.
+"""Tests for shared/alerts.py - doc_full Cloud Monitoring log line.
 
 Hard contract we lock down:
-  * never raises (Secret Manager outage, SendGrid 5xx, network error)
-  * never sends twice for the same customer in one run when given an
-    `alerted_customers` set
-  * when ALERT_EMAIL or SENDGRID_FROM is unset, returns False without
-    contacting Secret Manager or SendGrid
+  * exactly one WARNING-level record per call when not deduped
+  * structured `json_fields` shape with EXACT field names (a refactor
+    that renames `service` -> `svc` would silently break the prod
+    Cloud Monitoring filter `jsonPayload.service="gong"`, so we pin
+    the names here)
+  * never raises (logger fault, encoding fault, anything)
+  * per-run dedup via `alerted_customers`; key is added BEFORE emit
+    so a hung logger can't re-enter the same run
 """
-from unittest.mock import MagicMock
+import logging
+
+import pytest
 
 import shared.alerts as alerts
 
 
-def _enable_env(monkeypatch):
-    monkeypatch.setattr(alerts, "ALERT_EMAIL", "ops@example.com")
-    monkeypatch.setattr(alerts, "SENDGRID_FROM", "noreply@example.com")
+@pytest.fixture
+def cap(caplog):
+    """caplog scoped to shared.alerts at WARNING."""
+    caplog.set_level(logging.WARNING, logger="shared.alerts")
+    return caplog
 
 
-def test_skips_when_alert_email_unset(monkeypatch):
-    monkeypatch.setattr(alerts, "ALERT_EMAIL", "")
-    monkeypatch.setattr(alerts, "SENDGRID_FROM", "noreply@example.com")
-    # If the function tried to load the secret, the autouse poison fixture would fire.
-    assert alerts.send_doc_full_alert(
+def _records(cap):
+    return [r for r in cap.records if r.name == "shared.alerts"]
+
+
+def test_emits_warning_with_structured_fields(cap):
+    out = alerts.send_doc_full_alert(
         customer_label="Acme",
         customer_key="acme.com",
-        doc_ids=["doc-A"],
-        pending_count=3,
+        doc_ids=["doc-A", "doc-B"],
+        pending_count=7,
         service="gong",
-    ) is False
+    )
+    assert out is True
+
+    records = _records(cap)
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.levelno == logging.WARNING
+    # Human-readable fallback: works without google-cloud-logging.
+    assert rec.getMessage().startswith("doc_full ")
+    assert "service=gong" in rec.getMessage()
+    assert "customer=Acme" in rec.getMessage()
+
+    # Lock the structured-field NAMES exactly. The prod Cloud Monitoring
+    # filter is `jsonPayload.event="doc_full"` and operator alert routing
+    # depends on jsonPayload.service / .customer_label being these names.
+    assert rec.json_fields == {
+        "event": "doc_full",
+        "service": "gong",
+        "customer_label": "Acme",
+        "customer_key": "acme.com",
+        "doc_ids": ["doc-A", "doc-B"],
+        "pending_count": 7,
+    }
 
 
-def test_skips_when_sender_unset(monkeypatch):
-    monkeypatch.setattr(alerts, "ALERT_EMAIL", "ops@example.com")
-    monkeypatch.setattr(alerts, "SENDGRID_FROM", "")
-    assert alerts.send_doc_full_alert(
-        customer_label="Acme",
-        customer_key="acme.com",
-        doc_ids=["doc-A"],
-        pending_count=3,
-        service="gong",
-    ) is False
-
-
-def test_dedups_within_run(monkeypatch):
-    """Same customer_key in one run = one send attempt, regardless of failures."""
-    _enable_env(monkeypatch)
-    monkeypatch.setattr(alerts, "get_secret", lambda _name: "fake-key")
-
-    posted = MagicMock(return_value=MagicMock(status_code=202, text=""))
-    import requests
-    monkeypatch.setattr(requests, "post", posted)
-
+def test_dedups_within_run(cap):
     alerted = set()
     out1 = alerts.send_doc_full_alert(
         customer_label="Acme", customer_key="acme.com",
@@ -65,82 +75,57 @@ def test_dedups_within_run(monkeypatch):
 
     assert out1 is True
     assert out2 is False
-    assert posted.call_count == 1
     assert alerted == {"acme.com"}
+    assert len(_records(cap)) == 1
 
 
-def test_secret_manager_failure_returns_false(monkeypatch):
-    _enable_env(monkeypatch)
-    def boom(_name):
-        raise RuntimeError("secret manager down")
-    monkeypatch.setattr(alerts, "get_secret", boom)
+def test_no_dedup_set_emits_every_time(cap):
+    alerts.send_doc_full_alert(
+        customer_label="Acme", customer_key="acme.com",
+        doc_ids=["doc-A"], pending_count=1, service="gong",
+    )
+    alerts.send_doc_full_alert(
+        customer_label="Acme", customer_key="acme.com",
+        doc_ids=["doc-A"], pending_count=2, service="gong",
+    )
+    assert len(_records(cap)) == 2
 
+
+def test_distinct_services_distinct_records(cap):
+    alerts.send_doc_full_alert(
+        customer_label="Acme", customer_key="acme.com",
+        doc_ids=["doc-A"], pending_count=1, service="gong",
+    )
+    alerts.send_doc_full_alert(
+        customer_label="Acme", customer_key="C0XYZ",
+        doc_ids=["doc-A"], pending_count=2, service="slack",
+    )
+    records = _records(cap)
+    assert len(records) == 2
+    services = [r.json_fields["service"] for r in records]
+    assert services == ["gong", "slack"]
+
+
+def test_never_raises_on_logging_failure(monkeypatch):
+    """A broken logger must not bubble - data is already safe in GCS."""
+    def boom(*args, **kwargs):
+        raise RuntimeError("logging stack down")
+    monkeypatch.setattr(alerts.logger, "warning", boom)
+
+    alerted = set()
     out = alerts.send_doc_full_alert(
         customer_label="Acme", customer_key="acme.com",
         doc_ids=["doc-A"], pending_count=1, service="gong",
+        alerted_customers=alerted,
     )
+
     assert out is False
-
-
-def test_sendgrid_5xx_returns_false_does_not_raise(monkeypatch):
-    _enable_env(monkeypatch)
-    monkeypatch.setattr(alerts, "get_secret", lambda _name: "fake-key")
-
-    import requests
-    monkeypatch.setattr(
-        requests, "post",
-        MagicMock(return_value=MagicMock(status_code=503, text="upstream")),
-    )
-    assert alerts.send_doc_full_alert(
+    # Dedup-set was updated BEFORE the (failing) emit attempt: a
+    # repeat call in the same run must not retry.
+    assert alerted == {"acme.com"}
+    out2 = alerts.send_doc_full_alert(
         customer_label="Acme", customer_key="acme.com",
-        doc_ids=["doc-A"], pending_count=1, service="gong",
-    ) is False
-
-
-def test_sendgrid_network_error_returns_false(monkeypatch):
-    _enable_env(monkeypatch)
-    monkeypatch.setattr(alerts, "get_secret", lambda _name: "fake-key")
-
-    import requests
-    def boom(*a, **kw):
-        raise RuntimeError("dns fail")
-    monkeypatch.setattr(requests, "post", boom)
-
-    assert alerts.send_doc_full_alert(
-        customer_label="Acme", customer_key="acme.com",
-        doc_ids=["doc-A"], pending_count=1, service="gong",
-    ) is False
-
-
-def test_payload_shape(monkeypatch):
-    _enable_env(monkeypatch)
-    monkeypatch.setattr(alerts, "get_secret", lambda _name: "fake-key")
-
-    captured = {}
-    import requests
-    def fake_post(url, headers=None, data=None, timeout=None):
-        captured['url'] = url
-        captured['headers'] = headers
-        import json as _json
-        captured['payload'] = _json.loads(data)
-        captured['timeout'] = timeout
-        return MagicMock(status_code=202, text="")
-    monkeypatch.setattr(requests, "post", fake_post)
-
-    alerts.send_doc_full_alert(
-        customer_label="Acme",
-        customer_key="acme.com",
-        doc_ids=["doc-A", "doc-B"],
-        pending_count=7,
-        service="gong",
+        doc_ids=["doc-A"], pending_count=2, service="gong",
+        alerted_customers=alerted,
     )
-
-    assert captured['url'] == 'https://api.sendgrid.com/v3/mail/send'
-    assert captured['headers']['Authorization'] == 'Bearer fake-key'
-    p = captured['payload']
-    assert p['personalizations'][0]['to'][0]['email'] == 'ops@example.com'
-    assert p['from']['email'] == 'noreply@example.com'
-    assert 'gong doc full for Acme' in p['subject']
-    body = p['content'][0]['value']
-    assert 'doc-A, doc-B' in body
-    assert 'Pending items in GCS: 7' in body
+    assert out2 is False
